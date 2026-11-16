@@ -164,12 +164,14 @@ function Get-ScheduledTask { [CmdletBinding()] param($TaskName) }
 function Get-DnsClientNrptRule { [CmdletBinding()] param() }
 function Get-DnsClientNrptPolicy {
     [CmdletBinding()] param([switch]$Effective, $Namespace)
+    $unicodeZone = '.' + [Globalization.IdnMapping]::new().GetUnicode('xn--p1ai')
+    if ($Namespace -eq $unicodeZone) { return [pscustomobject]@{ NameServers = @('8.8.8.8') } }
     Write-Error 'Test policy absent' -ErrorId 'WIN32 4312'
 }
 $script:adapters += [pscustomobject]@{ InterfaceIndex = 21; Status = 'Up'; HardwareInterface = $true; InterfaceDescription = 'Wi-Fi' }
 $report = Show-DiagnosticReport 6>&1 | Out-String
 if ($report -notmatch 'Effective \.ru NRPT policy: no rule returned' -or
-    $report -notmatch 'Effective \.xn--p1ai NRPT policy: no rule returned' -or
+    $report -notmatch 'Effective \.xn--p1ai DNS: 8\.8\.8\.8' -or
     $report -notmatch '\[System DNS\] pubmed\.ncbi\.nlm\.nih\.gov  \[OK\]' -or
     $report -notmatch '\[Windows route\] xn--90aivcdt6dxbc\.xn--p1ai -> 203\.0\.113\.43 \[LAN/Wi-Fi gateway\]') {
     throw "Diagnosis did not continue after an absent NRPT rule: $report"

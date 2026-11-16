@@ -2227,7 +2227,9 @@ function Show-DiagnosticReport {
     Write-Host "Managed NRPT rules: $($managedRules.Count)"
     foreach ($namespace in $NationalBypassSuffixes) {
         try {
-            $policy = Get-DnsClientNrptPolicy -Effective -Namespace $namespace -ErrorAction Stop
+            # Effective policy exposes IDN namespaces in Unicode, even when the rule was installed in Punycode.
+            $policyNamespace = '.' + [Globalization.IdnMapping]::new().GetUnicode($namespace.Substring(1))
+            $policy = Get-DnsClientNrptPolicy -Effective -Namespace $policyNamespace -ErrorAction Stop
             if ($policy) {
                 Write-Host "Effective $namespace DNS: $(@($policy.NameServers) -join ', ')"
             } else {
