@@ -20,8 +20,9 @@ $resourceArguments += '/resource:' + (Join-Path $PSScriptRoot 'launcher\InstallU
 try {
     [IO.File]::WriteAllText($assemblyInfo, ('[assembly: System.Reflection.AssemblyVersion("' + $version + '.0")]'))
     & $compiler /nologo /target:exe /platform:anycpu /optimize+ /warnaserror+ /codepage:65001 `
-        /reference:System.Runtime.Serialization.dll "/out:$temporary" @resourceArguments $assemblyInfo `
-        (Join-Path $PSScriptRoot 'launcher\Program.cs') (Join-Path $PSScriptRoot 'launcher\Updater.cs')
+        /reference:System.Runtime.Serialization.dll /reference:System.Management.dll "/out:$temporary" @resourceArguments $assemblyInfo `
+        (Join-Path $PSScriptRoot 'launcher\Program.cs') (Join-Path $PSScriptRoot 'launcher\Updater.cs') `
+        (Join-Path $PSScriptRoot 'launcher\BrowserProxy.cs') (Join-Path $PSScriptRoot 'launcher\BrowserLan.cs')
     if ($LASTEXITCODE) { throw "C# compilation failed (exit code $LASTEXITCODE)." }
     [IO.File]::Copy($temporary, $output, $true)
     Write-Host "Built $output"

@@ -100,15 +100,37 @@ internal static class Program
             Console.WriteLine("2  ChatGPT и Codex — блокировка интернета вне VPN");
             Console.WriteLine("3  Zotero — исправление проблем с синхронизацией через локальный прокси");
             Console.WriteLine("4  Обновления программы — включить, отключить или проверить сейчас");
+            Console.WriteLine("5  Прокси для браузера — открыть сайты .ru и .рф напрямую с первого соединения");
             Console.WriteLine("0  Назад");
             switch (ReadChoice()) {
                 case "1": RoutesMenu(run); break;
                 case "2": GuardMenu(run); break;
                 case "3": ZoteroMenu(run); break;
                 case "4": if (UpdatesMenu(NoAutoUpdate, () => TryUpdate(true))) return true; break;
+                case "5": BrowserProxyMenu(); break;
                 case "0": return false;
                 default: UnknownChoice(); break;
             }
+        }
+    }
+
+    private static void BrowserProxyMenu()
+    {
+        for (;;) {
+            Console.WriteLine("\nПрокси для браузера");
+            Console.WriteLine("Открывает отдельный профиль. Сайты .ru и .рф используют прямой IPv4 или IPv6, если он доступен.");
+            Console.WriteLine("1  Открыть Microsoft Edge с прокси");
+            Console.WriteLine("2  Открыть Google Chrome с прокси");
+            Console.WriteLine("0  Назад");
+            string choice = ReadChoice();
+            if (choice == "0") return;
+            if (choice != "1" && choice != "2") { UnknownChoice(); continue; }
+            if (IsElevated()) {
+                Console.WriteLine("Для прокси и браузера запустите VPN_WORK обычным двойным кликом без прав администратора.");
+                continue;
+            }
+            try { BrowserProxy.OpenBrowser(DataRoot, choice == "1"); }
+            catch (Exception error) { Console.WriteLine("Прокси не запущен. " + error.Message); }
         }
     }
 

@@ -14,7 +14,7 @@ try {
     foreach ($name in ($components + @('build_exe.ps1', 'VERSION'))) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination $build
     }
-    foreach ($name in 'Program.cs', 'Updater.cs', 'InstallUpdate.ps1') {
+    foreach ($name in 'Program.cs', 'Updater.cs', 'BrowserProxy.cs', 'BrowserLan.cs', 'InstallUpdate.ps1') {
         Copy-Item -LiteralPath (Join-Path (Join-Path $root 'launcher') $name) -Destination (Join-Path $build 'launcher')
     }
     $exe = Join-Path $case 'Standalone copy\VPN_WORK.exe'
@@ -29,9 +29,9 @@ try {
         $hash = (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         if ("$name $hash" -notin $lines) { throw "Wrong embedded data: $name" }
     }
-    $menu = (@('1', '0', '2', '2', '0', '4', '0', '0', '0') | & $exe --no-update) -join "`n"
+    $menu = (@('1', '0', '2', '2', '0', '4', '0', '5', '0', '0', '0') | & $exe --no-update) -join "`n"
     $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
-    if ($LASTEXITCODE -ne 0 -or $menu -notmatch 'ChatGPT' -or $menu -notmatch 'Zotero' -or
+    if ($LASTEXITCODE -ne 0 -or $menu -notmatch 'ChatGPT' -or $menu -notmatch 'Zotero' -or $menu -notmatch 'Microsoft Edge' -or
         $menu -notmatch [regex]::Escape("VPN WORK $version")) { throw 'Standalone menu failed.' }
     if ((& $exe --version) -ne $version -or $LASTEXITCODE -ne 0) { throw 'Invalid executable version.' }
 
