@@ -73,6 +73,7 @@ function Resolve-DomainMap {
             'shared-b.example' { '198.51.100.11' }
             'rotate.example' { if ($script:phase -eq 1) { '198.51.100.12' } else { '198.51.100.13' } }
             'pubmed.ncbi.nlm.nih.gov' { '203.0.113.42' }
+            'xn--90aivcdt6dxbc.xn--p1ai' { '203.0.113.43' }
             default { '203.0.113.1' }
         }
         $result[$domain] = @($ip)
@@ -111,12 +112,16 @@ function Rollback-CurrentRun { param($Routes); throw 'Unexpected rollback in moc
 '@
 $assertions = @'
 $saved = Read-ManagedState
+foreach ($zone in @('.ru', '.xn--p1ai')) {
+    if ($zone -notin $saved.MonitorSuffixes) { throw "Zone missing from monitor: $zone" }
+}
+if (-not $script:routes.ContainsKey('203.0.113.43/32')) { throw 'Direct route for the seeded IDN site is missing' }
 foreach ($domain in @('www.ncbi.nlm.nih.gov', 'pubmed.ncbi.nlm.nih.gov', 'pmc.ncbi.nlm.nih.gov',
     'matrix.work.example', 'livekit-jwt.call.matrix.org')) {
     if ($domain -notin $saved.MonitorDomains) { throw "Service omitted from monitor: $domain" }
 }
 if ($script:phase -lt 3) {
-    foreach ($namespace in @('.ncbi.nlm.nih.gov', 'ncbi.nlm.nih.gov', '.element.io', '.matrix.org', 'matrix.work.example')) {
+    foreach ($namespace in @('.ru', '.xn--p1ai', '.ncbi.nlm.nih.gov', 'ncbi.nlm.nih.gov', '.element.io', '.matrix.org', 'matrix.work.example')) {
         if ($namespace -notin $script:namespaces) { throw "Service omitted from NRPT: $namespace" }
     }
 } else {

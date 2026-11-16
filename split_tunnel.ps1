@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-Настраивает обход VPN для рабочих сервисов, NCBI/PubMed, Element/Matrix, зоны .ru и пользовательских адресов.
+Настраивает обход VPN для рабочих сервисов, NCBI/PubMed, Element/Matrix, зон .ru и .рф и пользовательских адресов.
 
 .DESCRIPTION
 Один переносимый PowerShell-файл без внешних зависимостей. Скрипт сам запрашивает
@@ -15,8 +15,7 @@ Zotero; дополнительные адреса задаются в масси
 Element использует стандартные узлы, локальные конфиги и обнаружение публичных
 IPv4 его TCP-соединений на каждом ПК.
 
-Целые зоны задаются в массиве $BypassDomainSuffixes (по умолчанию «.ru»). DNS для
-такой зоны идёт мимо VPN целиком, а /32-маршруты создаются для хостов из
+Зоны .ru и .рф входят в $BypassDomainSuffixes. /32-маршруты создаются для хостов из
 $BypassSeedDomains (включая .gost.ru, .bmstu.ru, .gov.ru) и для всех хостов зоны,
 найденных в DNS-кэше Windows. Windows не умеет маршрутизировать по имени, поэтому
 сайт зоны, открытый впервые, может отправить первый запрос через VPN; фоновый
@@ -111,7 +110,9 @@ param(
 $PublicDnsServers = @("8.8.8.8", "1.1.1.1")
 $DnsProbeName = "example.com"
 $DnsCriticalNames = @("yougile.com", "yandex.ru")
-$SystemDnsProbeNames = @("yougile.com", "yandex.ru", "pubmed.ncbi.nlm.nih.gov", "matrix-client.matrix.org")
+$NationalBypassSuffixes = @(".ru", ".xn--p1ai")
+$BypassZoneProbeNames = @("yandex.ru", "xn--90aivcdt6dxbc.xn--p1ai") # объясняем.рф
+$SystemDnsProbeNames = $BypassZoneProbeNames + @("yougile.com", "pubmed.ncbi.nlm.nih.gov", "matrix-client.matrix.org")
 $NrptComment = "split_tunnel managed rule"
 $script:NrptTouched = $false
 $script:PreviousManagedNrptRules = @()
@@ -159,8 +160,7 @@ $CustomSiteDomains = @(
 # the background monitor discovers it in the DNS cache within a few seconds and
 # moves subsequent attempts to the direct path.
 # Non-ASCII suffixes must be written in punycode (".xn--p1ai" for ".рф").
-$BypassDomainSuffixes = @(
-    ".ru",
+$BypassDomainSuffixes = $NationalBypassSuffixes + @(
     ".vk.com", ".vkuser.net", ".vkuseraudio.net",
     ".userapi.com", ".vk-cdn.net"
 )
@@ -179,6 +179,7 @@ $BypassSeedDomains = @(
     "static.consultant.ru", "login.consultant.ru"
     "ozon.ru", "www.ozon.ru", "st.ozone.ru", "io.ozone.ru",
     "ir-20.ozone.ru", "v-1.ozone.ru"
+    "xn--90aivcdt6dxbc.xn--p1ai" # объясняем.рф
 )
 
 # WebDAV storage used by Zotero for attachment sync.
@@ -304,7 +305,7 @@ function ConvertTo-DomainName {
         }
         $uri = [uri]$candidate
         if (-not $uri.Host) { return $null }
-        return $uri.Host.TrimEnd('.').ToLowerInvariant()
+        return $uri.IdnHost.TrimEnd('.').ToLowerInvariant()
     } catch {
         Write-Host "WARNING: invalid custom site address is skipped: $Value"
         return $null
@@ -459,6 +460,14 @@ function Test-VpnOnlyDomain {
     return $name -match '(^|\.)(openai\.com|chatgpt\.com|oaistatic\.com|oaiusercontent\.com|oaistatsig\.com|openaimerge\.com)$'
 }
 
+function ConvertTo-CacheDnsName([string]$Value) {
+    $name = $Value.Trim().TrimEnd('.').ToLowerInvariant()
+    if ($name -match '[^\x00-\x7F]') {
+        try { return [Globalization.IdnMapping]::new().GetAscii($name) } catch { return '' }
+    }
+    return $name
+}
+
 function Find-CachedDomainsForSuffixes {
     param([string[]]$Suffixes)
 
@@ -477,9 +486,7 @@ function Find-CachedDomainsForSuffixes {
         $recordType = [string]$entry.Type
         if ($recordType -notin @("1", "A", "5", "CNAME")) { continue }
 
-        $name = [string]$entry.Entry
-        if (-not $name) { continue }
-        $name = $name.Trim().TrimEnd('.').ToLowerInvariant()
+        $name = ConvertTo-CacheDnsName ([string]$entry.Entry)
         if (-not $name -or (Test-VpnOnlyDomain $name)) { continue }
         if (-not (Test-DomainUnderSuffix -Domain $name -Suffixes $Suffixes)) { continue }
         $domains += $name
@@ -1748,7 +1755,7 @@ function Test-MonitoredDomain {
         [string[]]$Suffixes
     )
 
-    $normalized = $Domain.Trim().TrimEnd('.').ToLowerInvariant()
+    $normalized = ConvertTo-CacheDnsName $Domain
     if (-not $normalized -or (Test-VpnOnlyDomain $normalized)) { return $false }
     if ($ExactDomains.Contains($normalized)) { return $true }
     return Test-DomainUnderSuffix -Domain $normalized -Suffixes $Suffixes
@@ -1766,7 +1773,7 @@ function Get-MonitoredCacheCandidates {
     $names = @{}
     foreach ($entry in $Entries) {
         foreach ($value in @($entry.Entry, $entry.Name)) {
-            $name = ([string]$value).Trim().TrimEnd('.').ToLowerInvariant()
+            $name = ConvertTo-CacheDnsName ([string]$value)
             if ($name -and (Test-MonitoredDomain -Domain $name -ExactDomains $ExactDomains -Suffixes $Suffixes)) {
                 $names[$name] = $name
             }
@@ -1776,10 +1783,10 @@ function Get-MonitoredCacheCandidates {
         $changed = $false
         foreach ($entry in $Entries) {
             if ([string]$entry.Type -notin @("5", "CNAME")) { continue }
-            $target = ([string]$entry.Data).Trim().TrimEnd('.').ToLowerInvariant()
+            $target = ConvertTo-CacheDnsName ([string]$entry.Data)
             if (-not $target -or $names.ContainsKey($target) -or (Test-VpnOnlyDomain $target)) { continue }
             foreach ($value in @($entry.Name, $entry.Entry)) {
-                $alias = ([string]$value).Trim().TrimEnd('.').ToLowerInvariant()
+                $alias = ConvertTo-CacheDnsName ([string]$value)
                 if ($names.ContainsKey($alias)) {
                     $names[$target] = $names[$alias]
                     $changed = $true
@@ -1795,7 +1802,7 @@ function Get-MonitoredCacheCandidates {
         $ip = [string]$entry.Data
         if (-not $ip -or -not (Test-MonitorIpv4 -Value $ip)) { continue }
         foreach ($value in @($entry.Name, $entry.Entry)) {
-            $name = ([string]$value).Trim().TrimEnd('.').ToLowerInvariant()
+            $name = ConvertTo-CacheDnsName ([string]$value)
             if ($names.ContainsKey($name)) {
                 $candidates[$ip] = $names[$name]
                 break
@@ -1853,7 +1860,7 @@ function Start-RouteMonitor {
     }
     $gateway = $currentGateway
 
-    # Apply built-in host additions when the scheduled worker starts after
+    # Apply built-in host and suffix additions when the scheduled worker starts after
     # the script has been updated but its saved state is still older.
     $builtInDomains = @($Apps.Values | ForEach-Object { $_ } | Select-Object -Unique)
     $savedDomains = [Collections.Generic.HashSet[string]]::new(
@@ -1863,8 +1870,10 @@ function Start-RouteMonitor {
         if ($domain) { [void]$savedDomains.Add([string]$domain) }
     }
     $missingBuiltIns = @($builtInDomains | Where-Object { -not $savedDomains.Contains($_) })
-    if ($missingBuiltIns.Count -gt 0) {
-        Write-MonitorLog "Saved configuration lacks $($missingBuiltIns.Count) built-in domain(s); refreshing configuration."
+    $monitorSuffixes = @(ConvertTo-SuffixList -Values $configuration.MonitorSuffixes)
+    $missingSuffixes = @(ConvertTo-SuffixList -Values $BypassDomainSuffixes | Where-Object { $_ -notin $monitorSuffixes })
+    if ($missingBuiltIns.Count -gt 0 -or $missingSuffixes.Count -gt 0) {
+        Write-MonitorLog "Saved configuration lacks $($missingBuiltIns.Count) built-in domain(s) or $($missingSuffixes.Count) configured suffix(es); refreshing configuration."
         try { Request-ConfigurationRefresh } catch {
             Write-MonitorLog "ERROR: could not start configuration refresh: $($_.Exception.Message)"
         }
@@ -1873,12 +1882,7 @@ function Start-RouteMonitor {
     $knownDomains = @(
         @([string[]]$configuration.MonitorDomains) + $builtInDomains |
             Where-Object { $_ -and -not (Test-VpnOnlyDomain $_) } |
-            ForEach-Object { $_.Trim().TrimEnd('.').ToLowerInvariant() } |
-            Select-Object -Unique
-    )
-    $monitorSuffixes = @(
-        [string[]]$configuration.MonitorSuffixes |
-            Where-Object { $_ } |
+            ForEach-Object { ConvertTo-CacheDnsName $_ } |
             Select-Object -Unique
     )
     $dnsServers = @([string[]]$configuration.DnsServers | Where-Object { $_ })
@@ -2221,18 +2225,20 @@ function Show-DiagnosticReport {
     $managedRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
         Where-Object { $_.Comment -eq $NrptComment })
     Write-Host "Managed NRPT rules: $($managedRules.Count)"
-    try {
-        $effectiveRu = Get-DnsClientNrptPolicy -Effective -Namespace ".ru" -ErrorAction Stop
-        if ($effectiveRu) {
-            Write-Host "Effective .ru DNS: $(@($effectiveRu.NameServers) -join ', ')"
-        } else {
-            Write-Host "Effective .ru NRPT policy: no rule returned"
-        }
-    } catch {
-        if ($_.FullyQualifiedErrorId -match '\bWIN32 4312\b') {
-            Write-Host "Effective .ru NRPT policy: no rule returned"
-        } else {
-            Write-Host "WARNING: could not read .ru NRPT policy: $($_.Exception.Message)"
+    foreach ($namespace in $NationalBypassSuffixes) {
+        try {
+            $policy = Get-DnsClientNrptPolicy -Effective -Namespace $namespace -ErrorAction Stop
+            if ($policy) {
+                Write-Host "Effective $namespace DNS: $(@($policy.NameServers) -join ', ')"
+            } else {
+                Write-Host "Effective $namespace NRPT policy: no rule returned"
+            }
+        } catch {
+            if ($_.FullyQualifiedErrorId -match '\bWIN32 4312\b') {
+                Write-Host "Effective $namespace NRPT policy: no rule returned"
+            } else {
+                Write-Host "WARNING: could not read $namespace NRPT policy: $($_.Exception.Message)"
+            }
         }
     }
 
@@ -2257,8 +2263,23 @@ function Show-DiagnosticReport {
         }
     }
     foreach ($domain in @($DnsProbeName) + $SystemDnsProbeNames) {
-        $result = if (@(Resolve-Ips -Domain $domain -DnsServers @()).Count -gt 0) { "OK" } else { "NO USABLE IPv4 ANSWER" }
+        $ips = @(Resolve-Ips -Domain $domain -DnsServers @())
+        $result = if ($ips.Count -gt 0) { "OK" } else { "NO USABLE IPv4 ANSWER" }
         Write-Host "  [System DNS] $domain  [$result]"
+        if ($gateway -and $domain -in $BypassZoneProbeNames) {
+            foreach ($ip in $ips) {
+                $route = Find-NetRoute -RemoteIPAddress $ip -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DestinationPrefix } | Select-Object -First 1
+                $path = if (-not $route) {
+                    "unavailable"
+                } elseif ($route.InterfaceIndex -eq $gateway.IfIndex -and $route.NextHop -eq $gateway.Gateway) {
+                    "LAN/Wi-Fi gateway"
+                } else {
+                    "interface $($route.InterfaceIndex), next hop $($route.NextHop)"
+                }
+                Write-Host "  [Windows route] $domain -> $ip [$path]"
+            }
+        }
     }
 
     if ($IncludePlan) {

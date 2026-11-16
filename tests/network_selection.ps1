@@ -65,8 +65,12 @@ function Get-DnsClientServerAddress {
 function Find-NetRoute {
     [CmdletBinding()]
     param([string]$RemoteIPAddress)
-    $index = if ($RemoteIPAddress -eq "10.254.254.5") { 73 } else { 11 }
-    return [pscustomobject]@{ DestinationPrefix = "$RemoteIPAddress/32"; InterfaceIndex = $index }
+    $index = switch ($RemoteIPAddress) {
+        '10.254.254.5' { 73 }
+        '203.0.113.43' { 21 }
+        default { 11 }
+    }
+    return [pscustomobject]@{ DestinationPrefix = "$RemoteIPAddress/32"; InterfaceIndex = $index; NextHop = '192.168.1.1' }
 }
 
 $servers = @(Get-CurrentVpnDnsServers)
@@ -135,6 +139,7 @@ function Resolve-DnsName {
     if ($Name -eq 'yandex.ru') { throw 'DNS request timed out' }
     [pscustomobject]@{ Type = 'A'; IPAddress = '198.18.0.42' }
     if ($Name -eq 'pubmed.ncbi.nlm.nih.gov') { [pscustomobject]@{ Type = 'A'; IPAddress = '203.0.113.42' } }
+    if ($Name -eq 'xn--90aivcdt6dxbc.xn--p1ai') { [pscustomobject]@{ Type = 'A'; IPAddress = '203.0.113.43' } }
 }
 $answers = @(Resolve-Ips -Domain 'pubmed.ncbi.nlm.nih.gov' -DnsServers @())
 if ($answers.Count -ne 1 -or $answers[0] -ne '203.0.113.42') { throw 'System DNS lost the real A record or kept a synthetic address' }
@@ -146,21 +151,27 @@ $ConfigFile = 'test-config.txt'
 $ApplyLogFile = 'test-apply.log'
 $MonitorStateFile = Join-Path $PSScriptRoot 'missing-monitor-state.json'
 $MonitorTaskName = 'test'
-$SystemDnsProbeNames = @('yandex.ru', 'pubmed.ncbi.nlm.nih.gov')
+$NationalBypassSuffixes = @('.ru', '.xn--p1ai')
+$BypassZoneProbeNames = @('yandex.ru', 'xn--90aivcdt6dxbc.xn--p1ai')
+$SystemDnsProbeNames = $BypassZoneProbeNames + @('pubmed.ncbi.nlm.nih.gov')
 $PublicDnsServers = @('8.8.8.8')
 $userConfig = @{ Domains = @(); Suffixes = @(); Prefixes = @() }
 function Read-ManagedState { return $null }
 function Find-ElementDomains { return @() }
 function Get-ElementRemoteAddresses { return @() }
+function Get-LanDnsServers { param($Gateway); return @('192.168.1.1') }
 function Get-ScheduledTask { [CmdletBinding()] param($TaskName) }
 function Get-DnsClientNrptRule { [CmdletBinding()] param() }
 function Get-DnsClientNrptPolicy {
     [CmdletBinding()] param([switch]$Effective, $Namespace)
     Write-Error 'Test policy absent' -ErrorId 'WIN32 4312'
 }
+$script:adapters += [pscustomobject]@{ InterfaceIndex = 21; Status = 'Up'; HardwareInterface = $true; InterfaceDescription = 'Wi-Fi' }
 $report = Show-DiagnosticReport 6>&1 | Out-String
 if ($report -notmatch 'Effective \.ru NRPT policy: no rule returned' -or
-    $report -notmatch '\[System DNS\] pubmed\.ncbi\.nlm\.nih\.gov  \[OK\]') {
+    $report -notmatch 'Effective \.xn--p1ai NRPT policy: no rule returned' -or
+    $report -notmatch '\[System DNS\] pubmed\.ncbi\.nlm\.nih\.gov  \[OK\]' -or
+    $report -notmatch '\[Windows route\] xn--90aivcdt6dxbc\.xn--p1ai -> 203\.0\.113\.43 \[LAN/Wi-Fi gateway\]') {
     throw "Diagnosis did not continue after an absent NRPT rule: $report"
 }
 
