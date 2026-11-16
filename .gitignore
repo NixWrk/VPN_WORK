@@ -1,0 +1,4 @@
+# Per-PC addresses are kept when updating the shared scripts.
+/bypass_domains.txt
+/gpt_vpn_guard.local.json
+/dist/
