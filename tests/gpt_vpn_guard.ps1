@@ -33,6 +33,9 @@ elseif ($Scenario -eq 'Missing') { & $guard -Plan -VpnAdapter 'Missing VPN' }
 elseif ($Scenario -eq 'Disconnected') { & $guard -Plan -VpnAdapter 'Office tunnel' }
 elseif ($Scenario -eq 'Guid') { & $guard -Plan -VpnAdapter '3be596aa-8a8e-4839-9500-2961a25e179c' }
 elseif ($Scenario -eq 'BlockAll') { & $guard -Plan -BlockAll }
+elseif ($Scenario -eq 'GuidedMissing') { & $guard -Plan -Guided -VpnAdapter 'Missing VPN' }
+elseif ($Scenario -eq 'GuidedSaved') { & $guard -Plan -Guided }
+elseif ($Scenario -eq 'GuidedReselect') { & $guard -Plan -Guided -ChooseVpn }
 else { & $guard -Plan }
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath $runner -Encoding UTF8
@@ -65,10 +68,18 @@ exit $LASTEXITCODE
     if ($LASTEXITCODE -ne 0 -or $output -notmatch 'VPN interface: Other VPN' -or $output -notlike "*$browser*") {
         throw "Explicit adapter or browser with spaces not honored: $output"
     }
+    $beforeGuided = [IO.File]::ReadAllText($config)
+    $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner GuidedSaved) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $output -notmatch 'VPN interface: Other VPN') { throw "Guided mode did not reuse the saved VPN: $output" }
+    foreach ($scenario in 'GuidedMissing', 'GuidedReselect') {
+        $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner $scenario) -join "`n"
+        if ($LASTEXITCODE -ne 3 -or $output -match 'No VPN exception|Installed GPT VPN') { throw "Guided mode modified the guard: $output" }
+    }
+    if ([IO.File]::ReadAllText($config) -ne $beforeGuided) { throw 'Planning the guided setup changed the saved VPN.' }
     @{Programs=@('C:\missing\browser.exe')} | ConvertTo-Json | Set-Content -LiteralPath $config -Encoding UTF8
     $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner Configured) -join "`n"
     if ($LASTEXITCODE -ne 1 -or $output -notmatch 'existing executable') { throw "Invalid executable accepted: $output" }
-    Write-Host 'PASS: guard plan, fail-closed adapter selection, private runtime, explicit browser, and no elevation or WFP changes'
+    Write-Host 'PASS: guard plan, guided saved/quarantine-safe skip selection, private runtime, explicit browser, and no elevation or WFP changes'
 } finally {
     if (Test-Path -LiteralPath $absolute) { Remove-Item -LiteralPath $absolute -Recurse -Force }
 }

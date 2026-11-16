@@ -16,6 +16,7 @@ internal static class Program
         Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VPN_WORK");
     private static readonly string DataRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VPN_WORK");
+    private static readonly string NoAutoUpdate = Path.Combine(DataRoot, "disable-auto-update");
 
     private static int Main(string[] args)
     {
@@ -34,10 +35,17 @@ internal static class Program
             if (args.Length == 1 && args[0] == "--help") {
                 Console.WriteLine("VPN_WORK.exe             Open the Windows setup menu");
                 Console.WriteLine("VPN_WORK.exe --verify    List the embedded components and their SHA-256 hashes");
+                Console.WriteLine("VPN_WORK.exe --version   Print the release version");
+                Console.WriteLine("VPN_WORK.exe --no-update Skip the startup update check once");
                 return 0;
             }
-            if (args.Length != 0) { Console.Error.WriteLine("Unknown option. Use --help."); return 2; }
-            return RunMenu();
+            if (args.Length == 1 && args[0] == "--version") { Console.WriteLine(Updater.Current.ToString(3)); return 0; }
+            bool skipUpdate = args.Length == 1 && (args[0] == "--no-update" || args[0] == "--update-failed");
+            if (args.Length != 0 && !skipUpdate) { Console.Error.WriteLine("Unknown option. Use --help."); return 2; }
+            if (skipUpdate && args[0] == "--update-failed")
+                Console.WriteLine("Обновление не установилось. Сохранена предыдущая версия.");
+            if (!skipUpdate && !Console.IsInputRedirected && !File.Exists(NoAutoUpdate) && !IsElevated() && TryUpdate(false)) return 0;
+            return RunMenu(RunScript);
         } catch (Exception error) {
             Console.Error.WriteLine(error.Message);
             if (args.Length == 0 && !Console.IsInputRedirected) {
@@ -48,46 +56,190 @@ internal static class Program
         }
     }
 
-    private static int RunMenu()
+    private static int RunMenu(Func<string, string, int> run)
     {
         for (;;) {
-            Console.WriteLine("\nVPN WORK — настройки сети Windows");
-            Console.WriteLine(" 1  Установить или обновить обход VPN для выбранных сервисов");
-            Console.WriteLine(" 2  Включить защиту ChatGPT и Codex и выбрать VPN");
-            Console.WriteLine(" 3  Настроить локальный прокси Zotero");
-            Console.WriteLine(" 4  Изменить список адресов обхода в Блокноте");
-            Console.WriteLine(" 5  Изменить конфиг защиты ChatGPT и Codex");
-            Console.WriteLine(" 6  Диагностика обхода VPN");
-            Console.WriteLine(" 7  Состояние защиты ChatGPT и Codex");
-            Console.WriteLine(" 8  Удалить обход VPN");
-            Console.WriteLine(" 9  Снять защиту ChatGPT и Codex");
-            Console.WriteLine("10  Удалить прокси Zotero");
-            Console.WriteLine(" 0  Выход");
-            Console.Write("Выберите действие: ");
-            string selection = Console.ReadLine();
-            if (selection == null || selection.Trim() == "0") return 0;
-            if (selection.Trim().Length == 0) continue;
-
-            try {
-                int code;
-                switch (selection.Trim()) {
-                    case "1": code = RunScript("split_tunnel.ps1", "-Packaged"); break;
-                    case "2": code = RunScript("gpt_vpn_guard.ps1", "-Packaged"); break;
-                    case "3": code = RunScript("zotero_proxy.ps1", ""); break;
-                    case "4": code = RunScript("split_tunnel.ps1", "-Packaged -EditConfig"); break;
-                    case "5": EditGuardConfig(); code = 0; break;
-                    case "6": code = RunScript("split_tunnel.ps1", "-Packaged -Diagnose"); break;
-                    case "7": code = RunScript("gpt_vpn_guard.ps1", "-Packaged -Status"); break;
-                    case "8": code = RunScript("split_tunnel.ps1", "-Packaged -Remove"); break;
-                    case "9": code = RunScript("gpt_vpn_guard.ps1", "-Packaged -Remove"); break;
-                    case "10": code = RunScript("zotero_proxy.ps1", "-Remove"); break;
-                    default: Console.WriteLine("Нет такого пункта меню."); continue;
-                }
-                Console.WriteLine(code == 0 ? "Готово." : "Действие завершилось с кодом " + code + ".");
-            } catch (Win32Exception error) {
-                Console.WriteLine(error.NativeErrorCode == 1223 ? "Действие отменено." : error.Message);
-            } catch (Exception error) { Console.WriteLine(error.Message); }
+            Console.WriteLine("\nVPN WORK " + Updater.Current.ToString(3));
+            Console.WriteLine("1  Автоматическая настройка — применить рекомендуемые настройки");
+            Console.WriteLine("2  Ручная настройка — изменить отдельные функции или настройки обновлений");
+            Console.WriteLine("0  Выход");
+            switch (ReadChoice()) {
+                case "1": RunAutomatic(run); break;
+                case "2": if (RunManual(run)) return 0; break;
+                case "0": return 0;
+                default: UnknownChoice(); break;
+            }
         }
+    }
+
+    private static void RunAutomatic(Func<string, string, int> run)
+    {
+        Console.WriteLine("\nАвтоматическая настройка");
+        Console.WriteLine("• Избранные рабочие сайты, PubMed и Element будут работать мимо VPN.");
+        Console.WriteLine("• ChatGPT и Codex смогут выходить в интернет только через выбранный VPN.");
+        Console.WriteLine("  Подключите VPN. При первом запуске выберите его из списка. Если VPN не найден,");
+        Console.WriteLine("  этот шаг будет пропущен, а прежняя защита останется без изменений.");
+        Console.WriteLine("• Прокси Zotero обновится, только если уже настроен и Zotero закрыт.");
+        if (!Confirm("1  Применить настройки    0  Назад")) return;
+        int routes = RunAction(run, "split_tunnel.ps1", "-Packaged");
+        int guard = routes == 1223 ? 1223 : RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Guided");
+        int zotero = guard == 1223 ? 1223 : RunAction(run, "zotero_proxy.ps1", "-Automatic");
+        Console.WriteLine("\nРезультат автоматической настройки:");
+        Console.WriteLine("  Обход VPN: " + Result(routes));
+        Console.WriteLine("  Защита ChatGPT и Codex: " + Result(guard));
+        if (guard == 3) Console.WriteLine("    Чтобы включить её, подключите VPN и повторите настройку.");
+        Console.WriteLine("  Прокси Zotero: " + Result(zotero));
+        if (zotero == 3) Console.WriteLine("    Новый прокси можно включить вручную, если Zotero плохо синхронизируется.");
+    }
+
+    private static bool RunManual(Func<string, string, int> run)
+    {
+        for (;;) {
+            Console.WriteLine("\nРучная настройка");
+            Console.WriteLine("1  Обход VPN — выбранные сайты и приложения работают напрямую");
+            Console.WriteLine("2  ChatGPT и Codex — блокировка интернета вне VPN");
+            Console.WriteLine("3  Zotero — исправление проблем с синхронизацией через локальный прокси");
+            Console.WriteLine("4  Обновления программы — включить, отключить или проверить сейчас");
+            Console.WriteLine("0  Назад");
+            switch (ReadChoice()) {
+                case "1": RoutesMenu(run); break;
+                case "2": GuardMenu(run); break;
+                case "3": ZoteroMenu(run); break;
+                case "4": if (UpdatesMenu(NoAutoUpdate, () => TryUpdate(true))) return true; break;
+                case "0": return false;
+                default: UnknownChoice(); break;
+            }
+        }
+    }
+
+    private static void RoutesMenu(Func<string, string, int> run)
+    {
+        for (;;) {
+            Console.WriteLine("\nОбход VPN");
+            Console.WriteLine("1  Применить обход — обновить прямой доступ к рабочим сервисам и вашим адресам");
+            Console.WriteLine("2  Свои адреса — открыть список в Блокноте (один адрес на строку)");
+            Console.WriteLine("3  Проверить список — найти ошибки в файле без изменения сети");
+            Console.WriteLine("4  Диагностика — показать шлюз, DNS и состояние фоновой задачи");
+            Console.WriteLine("5  Убрать обход — удалить добавленные маршруты и DNS-правила, сохранить список");
+            Console.WriteLine("0  Назад");
+            switch (ReadChoice()) {
+                case "1": RunAction(run, "split_tunnel.ps1", "-Packaged"); break;
+                case "2":
+                    if (RunAction(run, "split_tunnel.ps1", "-Packaged -EditConfig") == 0)
+                        Console.WriteLine("После сохранения выберите «Применить обход».");
+                    break;
+                case "3": RunAction(run, "split_tunnel.ps1", "-Packaged -CheckConfig"); break;
+                case "4": RunAction(run, "split_tunnel.ps1", "-Packaged -Diagnose"); break;
+                case "5":
+                    if (Confirm("1  Убрать обход VPN    0  Назад")) RunAction(run, "split_tunnel.ps1", "-Packaged -Remove");
+                    break;
+                case "0": return;
+                default: UnknownChoice(); break;
+            }
+        }
+    }
+
+    private static void GuardMenu(Func<string, string, int> run)
+    {
+        for (;;) {
+            Console.WriteLine("\nЗащита ChatGPT и Codex");
+            Console.WriteLine("1  Выбрать VPN и включить защиту — сначала подключите нужный VPN");
+            Console.WriteLine("2  Дополнительные программы — добавить, например, отдельный браузер целиком");
+            Console.WriteLine("3  Проверить состояние — показать, установлены ли правила защиты");
+            Console.WriteLine("4  Заблокировать весь внешний доступ — до повторного выбора VPN");
+            Console.WriteLine("5  Снять защиту — снова разрешить подключение без VPN");
+            Console.WriteLine("0  Назад");
+            switch (ReadChoice()) {
+                case "1": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Guided -ChooseVpn"); break;
+                case "2": RunAction((name, args) => { EditGuardConfig(); return 0; }, "", ""); break;
+                case "3": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Status"); break;
+                case "4":
+                    if (Confirm("1  Заблокировать весь внешний доступ этих приложений    0  Назад"))
+                        RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -BlockAll");
+                    break;
+                case "5":
+                    if (Confirm("1  Снять защиту    0  Назад")) RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Remove");
+                    break;
+                case "0": return;
+                default: UnknownChoice(); break;
+            }
+        }
+    }
+
+    private static void ZoteroMenu(Func<string, string, int> run)
+    {
+        for (;;) {
+            Console.WriteLine("\nПрокси Zotero");
+            Console.WriteLine("Нужен только при проблемах с синхронизацией. Перед изменениями закройте Zotero.");
+            Console.WriteLine("1  Настроить или обновить локальный прокси");
+            Console.WriteLine("2  Убрать прокси — восстановить предыдущие настройки Zotero");
+            Console.WriteLine("0  Назад");
+            switch (ReadChoice()) {
+                case "1": RunAction(run, "zotero_proxy.ps1", ""); break;
+                case "2":
+                    if (Confirm("1  Убрать прокси Zotero    0  Назад")) RunAction(run, "zotero_proxy.ps1", "-Remove");
+                    break;
+                case "0": return;
+                default: UnknownChoice(); break;
+            }
+        }
+    }
+
+    private static bool UpdatesMenu(string preference, Func<bool> checkNow)
+    {
+        for (;;) {
+            bool enabled = !File.Exists(preference);
+            Console.WriteLine("\nОбновления программы");
+            Console.WriteLine("Текущая версия: " + Updater.Current.ToString(3) + ". Автообновление: " + (enabled ? "включено" : "выключено") + ".");
+            Console.WriteLine("1  " + (enabled ? "Отключить" : "Включить") + " проверку и установку обновлений при запуске");
+            Console.WriteLine("2  Проверить сейчас — установить более новую версию из GitHub, если она есть");
+            Console.WriteLine("0  Назад");
+            switch (ReadChoice()) {
+                case "1":
+                    try {
+                        if (enabled) { Directory.CreateDirectory(Path.GetDirectoryName(preference)); File.WriteAllText(preference, ""); }
+                        else File.Delete(preference);
+                        Console.WriteLine(enabled ? "Автообновление отключено." : "Автообновление включено.");
+                    } catch (Exception error) { Console.WriteLine(error.Message); }
+                    break;
+                case "2": if (checkNow()) return true; break;
+                case "0": return false;
+                default: UnknownChoice(); break;
+            }
+        }
+    }
+
+    private static bool TryUpdate(bool manual)
+    {
+        try {
+            if (IsElevated()) { if (manual) Console.WriteLine("Для обновления запустите программу без прав администратора."); return false; }
+            return Updater.CheckAndStart(manual, ReadResource);
+        } catch (Exception error) {
+            Console.WriteLine("Не удалось обновиться: " + error.Message);
+            Console.WriteLine("Можно продолжать работу с текущей версией.");
+            return false;
+        }
+    }
+
+    private static string ReadChoice()
+    {
+        Console.Write("Выберите номер: ");
+        string answer = Console.ReadLine();
+        return answer == null ? "0" : answer.Trim();
+    }
+
+    private static bool Confirm(string options) { Console.WriteLine(options); return ReadChoice() == "1"; }
+    private static void UnknownChoice() { Console.WriteLine("Введите номер из меню."); }
+    private static string Result(int code) { return code == 0 ? "готово" : code == 3 ? "пропущено" : code == 1223 ? "отменено" : "не удалось (код " + code + ")"; }
+
+    private static int RunAction(Func<string, string, int> run, string name, string arguments)
+    {
+        int code;
+        try { code = run(name, arguments); }
+        catch (Win32Exception error) { code = error.NativeErrorCode; if (code != 1223) Console.WriteLine(error.Message); }
+        catch (Exception error) { Console.WriteLine(error.Message); code = 1; }
+        Console.WriteLine("Результат: " + Result(code) + ".");
+        return code;
     }
 
     private static void EditGuardConfig()
@@ -102,7 +254,9 @@ internal static class Program
         using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "notepad.exe"),
             Quote(file)) { UseShellExecute = true })) { }
         Console.WriteLine("Настройки: " + file);
-        Console.WriteLine("После сохранения заново включите защиту через пункт 2.");
+        Console.WriteLine("В Programs укажите полные пути к .exe. В JSON обратная косая черта записывается как \\\\.");
+        Console.WriteLine("Весь добавленный браузер будет работать только через VPN, включая остальные вкладки.");
+        Console.WriteLine("После сохранения снова выберите VPN и включите защиту.");
     }
 
     private static int RunScript(string name, string arguments)

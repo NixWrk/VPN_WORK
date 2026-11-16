@@ -22,6 +22,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\zotero_proxy.ps1 -Remo
 [CmdletBinding()]
 param(
     [switch]$Remove,
+    [Parameter(DontShow = $true)][switch]$Automatic,
     [Parameter(DontShow = $true)][switch]$Worker,
     [Parameter(DontShow = $true)][int]$Port = 27654
 )
@@ -246,13 +247,24 @@ if ($Remove) {
     exit
 }
 
+$profileDirectories = @(Get-ZoteroProfiles)
+if ($Automatic -and (-not (Test-Path -LiteralPath $StateFile) -or -not $profileDirectories.Count)) {
+    Write-Host 'Zotero skipped: the proxy is not configured or no profile was found.'
+    exit 3
+}
+if (Get-Process zotero -ErrorAction SilentlyContinue) {
+    Write-Host 'Close Zotero before updating the proxy.'
+    if ($Automatic) { exit 3 }
+    exit 1
+}
+
 $oldState = if (Test-Path -LiteralPath $StateFile) {
     Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 $oldByPath = @{}
 foreach ($record in @($oldState.Profiles)) { $oldByPath[[string]$record.Directory] = $record }
 
-$records = foreach ($directory in Get-ZoteroProfiles) {
+$records = foreach ($directory in $profileDirectories) {
     $userJs = Join-Path $directory "user.js"
     $userJsExisted = Test-Path -LiteralPath $userJs
     [byte[]]$originalBytes = @()
@@ -280,7 +292,10 @@ $records = foreach ($directory in Get-ZoteroProfiles) {
     }
 }
 
-if (-not $records) { throw "No Zotero profile was configured" }
+if (-not $records) {
+    if ($Automatic) { Write-Host 'No suitable Zotero profile; existing proxy settings were kept.'; exit 3 }
+    throw "No Zotero profile was configured"
+}
 Register-ProxyTask $Port
 [ordered]@{ Version = 1; Port = $Port; Profiles = @($records) } |
     ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateFile -Encoding UTF8

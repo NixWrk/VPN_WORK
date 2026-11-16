@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Protects ChatGPT, Codex and explicitly selected Windows executables with a VPN-only network policy.
 .PARAMETER VpnAdapter
@@ -24,6 +24,8 @@ param(
     [switch]$Plan,
     [switch]$Status,
     [switch]$Remove,
+    [Parameter(DontShow = $true)][switch]$Guided,
+    [Parameter(DontShow = $true)][switch]$ChooseVpn,
     [Parameter(DontShow = $true)][switch]$Packaged,
     [switch]$Help
 )
@@ -104,15 +106,56 @@ function Find-GuardPrograms {
     return @($paths | Sort-Object -Unique)
 }
 
+function Select-GuidedVpnAdapter {
+    param([object[]]$Adapters, [string]$Saved, [switch]$Choose, [switch]$PlanOnly)
+
+    if ($Saved -and -not $Choose) {
+        $adapter = Select-VpnAdapter -Adapters $Adapters -Requested $Saved
+        if ($adapter) { return $adapter }
+        Write-Host 'Сохранённый VPN сейчас не подключён.'
+        return
+    }
+    $choices = @(Get-VpnAdapterChoices -Adapters $Adapters)
+    if (-not $choices.Count) { Write-Host 'Подключённый VPN не найден.'; return }
+    Write-Host 'Выберите интерфейс вашего VPN. Если не уверены, нажмите Enter для пропуска.'
+    for ($index = 0; $index -lt $choices.Count; $index++) {
+        Write-Host "  $($index + 1)  $($choices[$index].Name) — $($choices[$index].InterfaceDescription)"
+    }
+    if ($PlanOnly) { return }
+    while ($true) {
+        $answer = Read-Host 'Номер VPN (Enter — пропустить)'
+        if ([string]::IsNullOrWhiteSpace($answer)) { return }
+        $number = 0
+        if ([int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $choices.Count) {
+            return $choices[$number - 1]
+        }
+        Write-Host 'Введите номер из списка.'
+    }
+}
+
+function Save-GuidedVpnAdapter {
+    param([string]$Path, [guid]$Adapter, [string[]]$Programs)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+    $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [ordered]@{ VpnAdapter = $Adapter.ToString(); Programs = @($Programs | Where-Object { $_ }) } |
+            ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
 if ($Help) {
     Get-Help -Name $PSCommandPath -Detailed
     exit 0
 }
 
 try {
-    if (($Status -or $Remove) -and ($Plan -or $BlockAll -or $VpnAdapter -or $Program -or ($Status -and $Remove))) {
+    if (($Status -or $Remove) -and ($Plan -or $BlockAll -or $Guided -or $VpnAdapter -or $Program -or ($Status -and $Remove))) {
         throw 'Use -Status or -Remove on its own.'
     }
+    if (($ChooseVpn -and -not $Guided) -or ($Guided -and $BlockAll)) { throw 'Incompatible VPN selection modes.' }
 
     $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -122,6 +165,8 @@ try {
         }
         $argsForAdmin = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         if ($Packaged) { $argsForAdmin += ' -Packaged' }
+        if ($Guided) { $argsForAdmin += ' -Guided' }
+        if ($ChooseVpn) { $argsForAdmin += ' -ChooseVpn' }
         if ($Remove) { $argsForAdmin += ' -Remove' }
         if ($Status) { $argsForAdmin += ' -Status' }
         if ($BlockAll) { $argsForAdmin += ' -BlockAll' }
@@ -145,7 +190,10 @@ try {
         }
         $extra = @(Find-GuardPrograms -ExtraPrograms $Program -UserProfile $env:USERPROFILE)
         $adapter = $null
-        if (-not $BlockAll) {
+        if ($Guided) {
+            $adapter = Select-GuidedVpnAdapter -Adapters @(Get-NetAdapter -IncludeHidden) -Saved $VpnAdapter -Choose:$ChooseVpn -PlanOnly:$Plan
+            if (-not $adapter) { Write-Host 'Защита ChatGPT и Codex не изменена.'; exit 3 }
+        } elseif (-not $BlockAll) {
             $adapter = Select-VpnAdapter -Adapters @(Get-NetAdapter -IncludeHidden) -Requested $VpnAdapter -Prompt:(-not $Plan)
         }
         $adapterGuid = [guid]::Empty
@@ -164,13 +212,22 @@ try {
     Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs')
     if ($Status) {
         $count = [GptVpnFilter]::Count()
-        Write-Host "Installed GPT VPN filters: $count"
-        if ($count -eq 0) { exit 1 }
+        if ($Packaged) {
+            if ($count -eq 0) { Write-Host 'Защита ChatGPT и Codex не установлена.' }
+            else { Write-Host "Установлены правила защиты: $count. Это не проверка доступности VPN." }
+        } else {
+            Write-Host "Installed GPT VPN filters: $count"
+            if ($count -eq 0) { exit 1 }
+        }
     } elseif ($Remove) {
         Write-Host "Removed GPT VPN filters: $([GptVpnFilter]::Remove())"
     } else {
         $count = [GptVpnFilter]::Apply($adapterGuid, $ExecutableNames, $extra, $PackageFamilies)
         Write-Host "Installed GPT VPN filters: $count (blocking rules persist after restart)."
+        if ($Guided -and $VpnAdapter -ne $adapterGuid.ToString()) {
+            try { Save-GuidedVpnAdapter -Path $ConfigPath -Adapter $adapterGuid -Programs $Program }
+            catch { Write-Warning "Защита включена, но сохранить выбор VPN не удалось: $($_.Exception.Message)" }
+        }
     }
     exit 0
 } catch {

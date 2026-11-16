@@ -11,10 +11,12 @@ $components = @('split_tunnel.ps1', 'gpt_vpn_guard.ps1', 'gpt_vpn_filter.cs', 'z
 try {
     $build = Join-Path $case 'Build sources'
     [void][IO.Directory]::CreateDirectory((Join-Path $build 'launcher'))
-    foreach ($name in ($components + 'build_exe.ps1')) {
+    foreach ($name in ($components + @('build_exe.ps1', 'VERSION'))) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination $build
     }
-    Copy-Item -LiteralPath (Join-Path $root 'launcher\Program.cs') -Destination (Join-Path $build 'launcher')
+    foreach ($name in 'Program.cs', 'Updater.cs', 'InstallUpdate.ps1') {
+        Copy-Item -LiteralPath (Join-Path (Join-Path $root 'launcher') $name) -Destination (Join-Path $build 'launcher')
+    }
     $exe = Join-Path $case 'Standalone copy\VPN_WORK.exe'
     foreach ($attempt in 1..2) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $build 'build_exe.ps1') -OutputPath $exe
@@ -27,11 +29,75 @@ try {
         $hash = (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         if ("$name $hash" -notin $lines) { throw "Wrong embedded data: $name" }
     }
-    $menu = ('0' | & $exe) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $menu -notmatch 'ChatGPT' -or $menu -notmatch 'Zotero') { throw 'Standalone menu failed.' }
+    $menu = (@('1', '0', '2', '2', '0', '4', '0', '0', '0') | & $exe --no-update) -join "`n"
+    $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+    if ($LASTEXITCODE -ne 0 -or $menu -notmatch 'ChatGPT' -or $menu -notmatch 'Zotero' -or
+        $menu -notmatch [regex]::Escape("VPN WORK $version")) { throw 'Standalone menu failed.' }
+    if ((& $exe --version) -ne $version -or $LASTEXITCODE -ne 0) { throw 'Invalid executable version.' }
 
     $assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($exe))
-    $install = $assembly.GetType('Program').GetMethod('Install', [Reflection.BindingFlags]'NonPublic,Static')
+    $program = $assembly.GetType('Program')
+    $flags = [Reflection.BindingFlags]'NonPublic,Static'
+    $install = $program.GetMethod('Install', $flags)
+    $runMenu = [Delegate]::CreateDelegate([Func[Func[string,string,int],int]], $program.GetMethod('RunMenu', $flags))
+    $updates = [Delegate]::CreateDelegate([Func[string,Func[bool],bool]], $program.GetMethod('UpdatesMenu', $flags))
+    $calls = New-Object 'Collections.Generic.List[string]'
+    $fakeScript = [Func[string,string,int]] {
+        param($scriptName, $arguments)
+        $calls.Add("$scriptName $arguments")
+        if ($scriptName -eq 'gpt_vpn_guard.ps1') { return 3 }
+        if ($arguments -eq '-Automatic') { return 3 }
+        return 0
+    }
+    $originalIn = [Console]::In
+    $originalOut = [Console]::Out
+    $scratchOutput = New-Object IO.StringWriter
+    try {
+        [Console]::SetOut($scratchOutput)
+        # Cancel auto once, run it, then use the manual check and cancel removal.
+        [Console]::SetIn([IO.StringReader]::new("1`n0`n1`n1`n2`n1`n3`n5`n0`n0`n0`n0`n"))
+        if ($runMenu.Invoke($fakeScript) -ne 0 -or ($calls -join ';') -ne
+            'split_tunnel.ps1 -Packaged;gpt_vpn_guard.ps1 -Packaged -Guided;zotero_proxy.ps1 -Automatic;split_tunnel.ps1 -Packaged -CheckConfig') {
+            throw "Modes dispatched incorrect actions: $calls"
+        }
+        $preference = [string](Join-Path $case 'Test preferences\disable-auto-update')
+        $fakeUpdate = [Func[bool]]{ return $false }
+        [Console]::SetIn([IO.StringReader]::new("1`n0`n"))
+        if ($updates.Invoke($preference, $fakeUpdate) -or -not (Test-Path -LiteralPath $preference)) { throw 'Disabling updates did not persist.' }
+        [Console]::SetIn([IO.StringReader]::new("1`n0`n"))
+        if ($updates.Invoke($preference, $fakeUpdate) -or (Test-Path -LiteralPath $preference)) { throw 'Re-enabling updates did not clear the preference.' }
+    } finally {
+        [Console]::SetIn($originalIn)
+        [Console]::SetOut($originalOut)
+        $scratchOutput.Dispose()
+    }
+
+    $updater = $assembly.GetType('Updater')
+    $selectAsset = $updater.GetMethod('NewerAsset', $flags)
+    $knownVersion = [version]($version + '.0')
+    $next = '{0}.{1}.{2}' -f $knownVersion.Major, $knownVersion.Minor, ($knownVersion.Build + 1)
+    $meta = @{ tag_name = "v$next"; draft = $false; prerelease = $false; assets = @(@{
+        name='VPN_WORK.exe'; state='uploaded'; size=10; digest=('sha256:' + ('a' * 64));
+        browser_download_url="https://github.com/NixWrk/VPN_WORK/releases/download/v$next/VPN_WORK.exe"
+    }) }
+    $releaseArgs = [object[]]::new(3)
+    $releaseArgs[1] = $knownVersion
+    $releaseArgs[0] = [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Depth 4 -Compress))
+    if (-not $selectAsset.Invoke($null, $releaseArgs) -or $releaseArgs[2].ToString(3) -ne $next) { throw 'Valid release rejected.' }
+    $meta.prerelease = $true
+    $releaseArgs[0] = [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Depth 4 -Compress))
+    if ($selectAsset.Invoke($null, $releaseArgs)) { throw 'Prerelease accepted.' }
+    $meta.prerelease = $false
+    $meta.tag_name = "v$version"
+    $releaseArgs[0] = [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Depth 4 -Compress))
+    if ($selectAsset.Invoke($null, $releaseArgs)) { throw 'Same release was selected again.' }
+    $meta.tag_name = "v$next"
+    $meta.assets[0].browser_download_url = 'https://not-github.example/VPN_WORK.exe'
+    $releaseArgs[0] = [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Depth 4 -Compress))
+    $rejectedAsset = $false
+    try { [void]$selectAsset.Invoke($null, $releaseArgs) } catch { $rejectedAsset = $_.Exception.GetBaseException() -is [IO.InvalidDataException] }
+    if (-not $rejectedAsset) { throw 'Untrusted release URL accepted.' }
+
     $stage = [Delegate]::CreateDelegate([Func[string,string]], $install)
     $stagedRoot = Join-Path $case 'Test Program Files\VPN_WORK'
     [void][IO.Directory]::CreateDirectory((Split-Path $stagedRoot))
@@ -62,7 +128,7 @@ try {
         $rejected = $_.Exception.GetBaseException() -is [IO.IOException]
     }
     if (-not $rejected) { throw 'A modified installed script was accepted.' }
-    Write-Host 'PASS: standalone EXE, reproducible payloads, build paths with spaces, local configs and altered payload rejection'
+    Write-Host 'PASS: standalone EXE, automatic/manual actions, update preference and release validation, local configs, altered payload rejection'
 } finally {
     $env:LOCALAPPDATA = $originalData
     if (Test-Path -LiteralPath $case) { Remove-Item -LiteralPath $case -Recurse -Force }
