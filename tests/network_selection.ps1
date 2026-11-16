@@ -10,7 +10,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($errors.Count -gt 0) { throw "split_tunnel.ps1 has syntax errors" }
 foreach ($name in @(
     "Find-RealGateway", "Get-CurrentVpnDnsServers", "Test-DnsCandidate",
-    "ConvertFrom-NslookupAnswer"
+    "ConvertFrom-NslookupAnswer", "Test-MonitorIpv4", "Resolve-Ips", "Show-DiagnosticReport"
 )) {
     $definition = $ast.FindAll({
         param($node)
@@ -95,7 +95,7 @@ if (Find-RealGateway) { throw "VPN selected after the physical gateway disappear
 $parsed = @(ConvertFrom-NslookupAnswer `
     -Lines @(
         "Server: UnKnown", "Address: 10.254.254.5", "",
-        "Name: yougile.com", "Addresses: 78.155.198.59", "  77.88.44.55"
+        "Name: yougile.com", "Addresses: 78.155.198.59", "  77.88.44.55", "  198.19.0.5"
     ) `
     -Server "10.254.254.5")
 if ($parsed.Count -ne 2 -or "10.254.254.5" -in $parsed) {
@@ -128,4 +128,40 @@ if (-not (Test-DnsCandidate -Server "10.254.254.5")) {
     throw "A resolver covering the managed domains was rejected"
 }
 
-Write-Host "PASS: VPN DNS discovery, gateway rediscovery, nslookup parsing and service DNS coverage"
+function Resolve-DnsName {
+    [CmdletBinding()]
+    param($Name, $Type, $Server, [switch]$DnsOnly, [switch]$NoHostsFile, [switch]$QuickTimeout)
+    if ($PSBoundParameters.ContainsKey('Server')) { throw 'System DNS must not set -Server' }
+    if ($Name -eq 'yandex.ru') { throw 'DNS request timed out' }
+    [pscustomobject]@{ Type = 'A'; IPAddress = '198.18.0.42' }
+    if ($Name -eq 'pubmed.ncbi.nlm.nih.gov') { [pscustomobject]@{ Type = 'A'; IPAddress = '203.0.113.42' } }
+}
+$answers = @(Resolve-Ips -Domain 'pubmed.ncbi.nlm.nih.gov' -DnsServers @())
+if ($answers.Count -ne 1 -or $answers[0] -ne '203.0.113.42') { throw 'System DNS lost the real A record or kept a synthetic address' }
+foreach ($domain in @('yandex.ru', 'fake.example')) {
+    if (@(Resolve-Ips -Domain $domain -DnsServers @()).Count -gt 0) { throw "Unusable DNS answer was accepted: $domain" }
+}
+
+$ConfigFile = 'test-config.txt'
+$ApplyLogFile = 'test-apply.log'
+$MonitorStateFile = Join-Path $PSScriptRoot 'missing-monitor-state.json'
+$MonitorTaskName = 'test'
+$SystemDnsProbeNames = @('yandex.ru', 'pubmed.ncbi.nlm.nih.gov')
+$PublicDnsServers = @('8.8.8.8')
+$userConfig = @{ Domains = @(); Suffixes = @(); Prefixes = @() }
+function Read-ManagedState { return $null }
+function Find-ElementDomains { return @() }
+function Get-ElementRemoteAddresses { return @() }
+function Get-ScheduledTask { [CmdletBinding()] param($TaskName) }
+function Get-DnsClientNrptRule { [CmdletBinding()] param() }
+function Get-DnsClientNrptPolicy {
+    [CmdletBinding()] param([switch]$Effective, $Namespace)
+    Write-Error 'Test policy absent' -ErrorId 'WIN32 4312'
+}
+$report = Show-DiagnosticReport 6>&1 | Out-String
+if ($report -notmatch 'Effective \.ru NRPT policy: no rule returned' -or
+    $report -notmatch '\[System DNS\] pubmed\.ncbi\.nlm\.nih\.gov  \[OK\]') {
+    throw "Diagnosis did not continue after an absent NRPT rule: $report"
+}
+
+Write-Host "PASS: gateway selection, VPN and system DNS, nslookup, synthetic IP filtering and missing NRPT policy"

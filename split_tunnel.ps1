@@ -111,6 +111,7 @@ param(
 $PublicDnsServers = @("8.8.8.8", "1.1.1.1")
 $DnsProbeName = "example.com"
 $DnsCriticalNames = @("yougile.com", "yandex.ru")
+$SystemDnsProbeNames = @("yougile.com", "yandex.ru", "pubmed.ncbi.nlm.nih.gov", "matrix-client.matrix.org")
 $NrptComment = "split_tunnel managed rule"
 $script:NrptTouched = $false
 $script:PreviousManagedNrptRules = @()
@@ -1084,7 +1085,7 @@ function Test-DnsServer {
 
     try {
         $answer = Resolve-DnsName @arguments
-        return [bool]@($answer | Where-Object { $_.Type -eq "A" -and $_.IPAddress }).Count
+        return [bool]@($answer | Where-Object { $_.Type -eq "A" -and $_.IPAddress -and (Test-MonitorIpv4 $_.IPAddress) }).Count
     } catch {
         return $false
     }
@@ -1105,9 +1106,7 @@ function ConvertFrom-NslookupAnswer {
             if (-not [Net.IPAddress]::TryParse($match.Value, [ref]$address)) { continue }
             if ($address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { continue }
             if ($address.IPAddressToString -eq $Server) { continue }
-            if ($address.GetAddressBytes()[0] -eq 0 -or
-                $address.GetAddressBytes()[0] -eq 127 -or
-                $address.GetAddressBytes()[0] -ge 224) { continue }
+            if (-not (Test-MonitorIpv4 $address.IPAddressToString)) { continue }
             $address.IPAddressToString
         }
     )
@@ -1132,7 +1131,7 @@ function Resolve-IpsWithNslookup {
 }
 
 function Test-DnsCandidate {
-    param([Parameter(Mandatory = $true)][string]$Server)
+    param([Parameter(Mandatory = $true)][string]$Server, [switch]$Report)
 
     # Resolving example.com alone does not prove that the resolver can serve
     # the domains managed by this script.
@@ -1140,6 +1139,7 @@ function Test-DnsCandidate {
     foreach ($name in @($DnsProbeName) + $DnsCriticalNames) {
         if (-not (Test-DnsServer -Server $Server -Name $name -SkipCacheClear) -and
             @(Resolve-IpsWithNslookup -Domain $name -Server $Server).Count -eq 0) {
+            if ($Report) { Write-Host "  [DNS] $server -> $name [NO USABLE IPv4 ANSWER]" }
             return $false
         }
     }
@@ -1147,22 +1147,11 @@ function Test-DnsCandidate {
 }
 
 function Test-EffectiveManagedDns {
-    try {
-        $answer = Resolve-DnsName `
-            -Name "yandex.ru" `
-            -Type A `
-            -DnsOnly `
-            -NoHostsFile `
-            -QuickTimeout `
-            -ErrorAction Stop
-        return [bool]@($answer | Where-Object { $_.Type -eq "A" -and $_.IPAddress }).Count
-    } catch {
-        return $false
-    }
+    return (@(Resolve-Ips -Domain "yandex.ru" -DnsServers @()).Count -gt 0)
 }
 
 function Test-DnsViaNrpt {
-    param([Parameter(Mandatory = $true)][string]$Server)
+    param([Parameter(Mandatory = $true)][string]$Server, [switch]$Report)
 
     # An explicit -Server lookup can succeed while Windows blocks that resolver
     # for NRPT. Probe the actual system resolution path before choosing it.
@@ -1183,8 +1172,11 @@ function Test-DnsViaNrpt {
             -NoHostsFile `
             -QuickTimeout `
             -ErrorAction Stop
-        return [bool]@($answer | Where-Object { $_.Type -eq "A" -and $_.IPAddress }).Count
+        if (@($answer | Where-Object { $_.Type -eq "A" -and $_.IPAddress -and (Test-MonitorIpv4 $_.IPAddress) }).Count -gt 0) { return $true }
+        if ($Report) { Write-Host "  [NRPT probe] $server [NO USABLE IPv4 ANSWER]" }
+        return $false
     } catch {
+        if ($Report) { Write-Host "  [NRPT probe] $server [FAILED: $($_.Exception.Message)]" }
         return $false
     } finally {
         if ($probeRule) {
@@ -1197,25 +1189,22 @@ function Test-DnsViaNrpt {
 function Resolve-Ips {
     param(
         [Parameter(Mandatory = $true)][string]$Domain,
-        [Parameter(Mandatory = $true)][string[]]$DnsServers
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$DnsServers
     )
 
     $allIps = @()
-    foreach ($server in $DnsServers) {
-        $answer = Resolve-DnsName `
-            -Name $Domain `
-            -Type A `
-            -Server $server `
-            -DnsOnly `
-            -NoHostsFile `
-            -QuickTimeout `
-            -ErrorAction SilentlyContinue
+    $servers = @($DnsServers)
+    if ($servers.Count -eq 0) { $servers = @('') } # Use the Windows DNS client without forcing a server.
+    foreach ($server in $servers) {
+        $params = @{ Name = $Domain; Type = 'A'; DnsOnly = $true; NoHostsFile = $true; QuickTimeout = $true; ErrorAction = 'Stop' }
+        if ($server) { $params.Server = $server }
+        $answer = try { Resolve-DnsName @params } catch { @() }
         $ips = @(
             $answer |
-                Where-Object { $_.Type -eq "A" -and $_.IPAddress } |
+                Where-Object { $_.Type -eq "A" -and $_.IPAddress -and (Test-MonitorIpv4 $_.IPAddress) } |
                 Select-Object -ExpandProperty IPAddress -Unique
         )
-        if ($ips.Count -eq 0) {
+        if ($ips.Count -eq 0 -and $server) {
             $ips = @(Resolve-IpsWithNslookup -Domain $Domain -Server $server)
         }
         $allIps += $ips
@@ -1226,7 +1215,7 @@ function Resolve-Ips {
 function Resolve-DomainMap {
     param(
         [Parameter(Mandatory = $true)][string[]]$Domains,
-        [Parameter(Mandatory = $true)][string[]]$DnsServers,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$DnsServers,
         [ValidateRange(1, 32)][int]$Throttle = 12
     )
 
@@ -1239,7 +1228,7 @@ function Resolve-DomainMap {
     try {
         $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         $sessionState.ImportPSModule(@("DnsClient"))
-        foreach ($functionName in @("ConvertFrom-NslookupAnswer", "Resolve-IpsWithNslookup")) {
+        foreach ($functionName in @("Test-MonitorIpv4", "ConvertFrom-NslookupAnswer", "Resolve-IpsWithNslookup", "Resolve-Ips")) {
             $definition = (Get-Command $functionName -CommandType Function).Definition
             $sessionState.Commands.Add(
                 [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
@@ -1253,41 +1242,7 @@ function Resolve-DomainMap {
         $worker = {
             param($Domain, $Servers)
 
-            $ips = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            $failedServers = [Collections.Generic.List[string]]::new()
-            foreach ($server in $Servers) {
-                $serverSucceeded = $false
-                try {
-                    $answer = Resolve-DnsName `
-                        -Name $Domain `
-                        -Type A `
-                        -Server $server `
-                        -DnsOnly `
-                        -NoHostsFile `
-                        -QuickTimeout `
-                        -ErrorAction Stop
-                    foreach ($record in @($answer)) {
-                        if ($record.Type -eq "A" -and $record.IPAddress) {
-                            [void]$ips.Add([string]$record.IPAddress)
-                            $serverSucceeded = $true
-                        }
-                    }
-                } catch {}
-                if (-not $serverSucceeded) {
-                    foreach ($ip in @(Resolve-IpsWithNslookup -Domain $Domain -Server $server)) {
-                        [void]$ips.Add([string]$ip)
-                        $serverSucceeded = $true
-                    }
-                }
-                if (-not $serverSucceeded) {
-                    [void]$failedServers.Add([string]$server)
-                }
-            }
-            [PSCustomObject]@{
-                Domain = $Domain
-                Ips = [string[]]@($ips)
-                FailedServers = [string[]]@($failedServers)
-            }
+            [PSCustomObject]@{ Ips = @(Resolve-Ips -Domain $Domain -DnsServers $Servers) }
         }
 
         foreach ($domain in $uniqueDomains) {
@@ -1302,24 +1257,12 @@ function Resolve-DomainMap {
         }
 
         foreach ($job in $jobs) {
-            $ips = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            $failedServers = @()
             try {
-                $result = @($job.Shell.EndInvoke($job.Handle) | Select-Object -Last 1)
-                foreach ($ip in @($result.Ips)) {
-                    if ($ip) { [void]$ips.Add([string]$ip) }
-                }
-                $failedServers = @($result.FailedServers | Where-Object { $_ })
+                $result = $job.Shell.EndInvoke($job.Handle) | Select-Object -Last 1
+                if ($null -ne $result) { $domainMap[$job.Domain] = @($result.Ips) }
             } catch {
-                $failedServers = @($DnsServers)
+                # Fall back below if the runspace itself failed.
             }
-
-            if ($failedServers.Count -gt 0) {
-                foreach ($ip in @(Resolve-Ips -Domain $job.Domain -DnsServers $failedServers)) {
-                    [void]$ips.Add([string]$ip)
-                }
-            }
-            $domainMap[$job.Domain] = [string[]]@($ips)
         }
     } catch {
         # A runspace/module failure must affect speed only, never DNS coverage.
@@ -1563,8 +1506,8 @@ function Add-ManagedNrptRules {
 
 function Sync-ManagedNrptRules {
     param(
-        [Parameter(Mandatory = $true)][string[]]$Namespaces,
-        [Parameter(Mandatory = $true)][string[]]$NameServers,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Namespaces,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$NameServers,
         [string[]]$PreviousRuleNames = @()
     )
 
@@ -1603,7 +1546,7 @@ function Sync-ManagedNrptRules {
             [void]$keptNamespaces.Add($ruleNamespaces[0])
             $ruleNames += [string]$rule.Name
         } else {
-            $rule | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue
+            $rule | Remove-DnsClientNrptRule -Force -ErrorAction Stop
         }
     }
 
@@ -1792,8 +1735,10 @@ function Test-MonitorIpv4 {
     if ($address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
         return $false
     }
-    $firstOctet = $address.GetAddressBytes()[0]
-    return ($firstOctet -gt 0 -and $firstOctet -ne 127 -and $firstOctet -lt 224)
+    $bytes = $address.GetAddressBytes()
+    # 198.18.0.0/15 is commonly synthesized by TUN DNS (FakeIP). Its addresses are not direct targets.
+    return ($bytes[0] -gt 0 -and $bytes[0] -ne 127 -and $bytes[0] -lt 224 -and
+        -not ($bytes[0] -eq 198 -and $bytes[1] -in @(18, 19)))
 }
 
 function Test-MonitoredDomain {
@@ -1937,7 +1882,8 @@ function Start-RouteMonitor {
             Select-Object -Unique
     )
     $dnsServers = @([string[]]$configuration.DnsServers | Where-Object { $_ })
-    if ($knownDomains.Count -eq 0 -or $dnsServers.Count -eq 0) {
+    $useSystemDns = [string]$configuration.DnsMode -eq "System"
+    if ($knownDomains.Count -eq 0 -or (-not $useSystemDns -and $dnsServers.Count -eq 0)) {
         Write-MonitorLog "ERROR: saved domains or DNS servers are empty."
         exit 1
     }
@@ -1952,6 +1898,10 @@ function Start-RouteMonitor {
     $configuredPrefixes = @($configuration.Routes | ForEach-Object { $_.Prefix })
     foreach ($record in @($monitorState.Routes)) {
         if (-not $record.Prefix) { continue }
+        if ($record.Prefix -like "*/32" -and -not (Test-MonitorIpv4 ($record.Prefix -split '/', 2)[0])) {
+            Remove-MonitorRouteRecord -Record $record
+            continue
+        }
         # A re-apply can adopt a dynamic IP as a persistent route, including
         # an IP shared by a newly configured host. Leave its active route alone.
         if ($record.Prefix -in $configuredPrefixes) {
@@ -2088,7 +2038,7 @@ function Start-RouteMonitor {
             }
         }
 
-        if (($now - $lastDnsCheck).TotalSeconds -ge $MonitorDnsCheckSeconds) {
+        if (-not $useSystemDns -and ($now - $lastDnsCheck).TotalSeconds -ge $MonitorDnsCheckSeconds) {
             $dnsAvailable = $false
             foreach ($server in $dnsServers) {
                 if (Test-DnsServer -Server $server -SkipCacheClear) {
@@ -2233,6 +2183,7 @@ function Show-DiagnosticReport {
 
     Write-Host "Split-tunnel diagnosis (no settings changed)"
     Write-Host "User config: $ConfigFile"
+    Write-Host "Apply log: $ApplyLogFile"
     Write-Host "  $($userConfig.Domains.Count) host(s), $($userConfig.Suffixes.Count) suffix(es), $($userConfig.Prefixes.Count) IPv4 prefix(es)"
     Write-Host "Element config host(s): $(@(Find-ElementDomains) -join ', ')"
     Write-Host "Element public TCP peer(s): $(@(Get-ElementRemoteAddresses) -join ', ')"
@@ -2246,6 +2197,7 @@ function Show-DiagnosticReport {
     $state = Read-ManagedState
     if ($state) {
         Write-Host "Saved gateway: $($state.Gateway), interface $($state.InterfaceIndex); $(@($state.Routes).Count) route(s)"
+        if ($state.DnsMode) { Write-Host "Saved DNS mode: $($state.DnsMode)" }
         if ($gateway -and (
             [int]$state.InterfaceIndex -ne [int]$gateway.IfIndex -or
             [string]$state.Gateway -ne [string]$gateway.Gateway
@@ -2269,9 +2221,19 @@ function Show-DiagnosticReport {
     $managedRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
         Where-Object { $_.Comment -eq $NrptComment })
     Write-Host "Managed NRPT rules: $($managedRules.Count)"
-    $effectiveRu = Get-DnsClientNrptPolicy -Effective -Namespace ".ru" -ErrorAction SilentlyContinue
-    if ($effectiveRu) {
-        Write-Host "Effective .ru DNS: $(@($effectiveRu.NameServers) -join ', ')"
+    try {
+        $effectiveRu = Get-DnsClientNrptPolicy -Effective -Namespace ".ru" -ErrorAction Stop
+        if ($effectiveRu) {
+            Write-Host "Effective .ru DNS: $(@($effectiveRu.NameServers) -join ', ')"
+        } else {
+            Write-Host "Effective .ru NRPT policy: no rule returned"
+        }
+    } catch {
+        if ($_.FullyQualifiedErrorId -match '\bWIN32 4312\b') {
+            Write-Host "Effective .ru NRPT policy: no rule returned"
+        } else {
+            Write-Host "WARNING: could not read .ru NRPT policy: $($_.Exception.Message)"
+        }
     }
 
     $lanDns = @()
@@ -2294,19 +2256,8 @@ function Show-DiagnosticReport {
             Write-Host "  [VPN DNS] $server -> $domain  [$result]"
         }
     }
-    foreach ($domain in $DnsCriticalNames) {
-        try {
-            $answer = @(Resolve-DnsName `
-                -Name $domain `
-                -Type A `
-                -DnsOnly `
-                -QuickTimeout `
-                -ErrorAction Stop |
-                Where-Object { $_.Type -eq "A" -and $_.IPAddress })
-            $result = if ($answer.Count -gt 0) { "OK" } else { "FAILED" }
-        } catch {
-            $result = "FAILED"
-        }
+    foreach ($domain in @($DnsProbeName) + $SystemDnsProbeNames) {
+        $result = if (@(Resolve-Ips -Domain $domain -DnsServers @()).Count -gt 0) { "OK" } else { "NO USABLE IPv4 ANSWER" }
         Write-Host "  [System DNS] $domain  [$result]"
     }
 
@@ -2560,8 +2511,8 @@ foreach ($server in @($lanDnsServers + $PublicDnsServers | Select-Object -Unique
         -AdoptableRouteIndex $adoptableRouteIndex
     if (
         -not $routeResult.Ok -or
-        -not (Test-DnsCandidate -Server $server) -or
-        -not (Test-DnsViaNrpt -Server $server)
+        -not (Test-DnsCandidate -Server $server -Report) -or
+        -not (Test-DnsViaNrpt -Server $server -Report)
     ) {
         if ($routeResult.Created) {
             Remove-RouteRecord $routeResult.Record
@@ -2598,7 +2549,7 @@ if ($workingDnsServers.Count -gt 0) {
 } else {
     Write-Host "Direct public DNS is unavailable; testing the current route as a fallback..."
     foreach ($server in $PublicDnsServers) {
-        if ((Test-DnsCandidate -Server $server) -and (Test-DnsViaNrpt -Server $server)) {
+        if ((Test-DnsCandidate -Server $server -Report) -and (Test-DnsViaNrpt -Server $server -Report)) {
             Write-Host "  [DNS] $server -> current route  [OK]"
             $workingDnsServers += $server
         } else {
@@ -2611,7 +2562,7 @@ if ($workingDnsServers.Count -gt 0) {
     } else {
         Write-Host "Public DNS is unavailable; testing DNS servers of active VPN adapters..."
         foreach ($server in @(Get-CurrentVpnDnsServers)) {
-            if ((Test-DnsCandidate -Server $server) -and (Test-DnsViaNrpt -Server $server)) {
+            if ((Test-DnsCandidate -Server $server -Report) -and (Test-DnsViaNrpt -Server $server -Report)) {
                 $workingDnsServers += $server
                 Write-Host "  [DNS] $server -> active VPN adapter  [OK]"
             }
@@ -2621,10 +2572,35 @@ if ($workingDnsServers.Count -gt 0) {
 }
 
 $workingDnsServers = @($workingDnsServers | Select-Object -Unique)
+$script:PreviousManagedNrptRules = @(
+    Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Comment -eq $NrptComment -or
+            [string]$_.Name -in @($savedNrptRuleNames)
+        } |
+        ForEach-Object {
+            [pscustomobject]@{
+                Namespace = @([string[]]$_.Namespace)
+                NameServers = @([string[]]$_.NameServers)
+                DisplayName = [string]$_.DisplayName
+            }
+        }
+)
+$createdNrptNames = @()
 if ($workingDnsServers.Count -eq 0) {
-    Write-Host "ERROR: no working DNS server was found. No split-tunnel changes were kept."
-    Rollback-CurrentRun $createdRoutes
-    exit 1
+    $dnsMode = "System"
+    Write-Host "No explicit DNS passed the checks. Resolving managed services through the Windows DNS client."
+    if ($script:PreviousManagedNrptRules.Count -gt 0) {
+        $script:NrptTouched = $true
+        try {
+            Sync-ManagedNrptRules -Namespaces @() -NameServers @() -PreviousRuleNames $savedNrptRuleNames | Out-Null
+            Clear-DnsClientCache -ErrorAction SilentlyContinue
+        } catch {
+            Write-Host "ERROR: could not remove previous split-tunnel DNS rules: $($_.Exception.Message)"
+            Rollback-CurrentRun $createdRoutes
+            exit 1
+        }
+    }
 }
 Write-Host ""
 Write-Host "Adding persistent static service-network routes:"
@@ -2782,6 +2758,9 @@ if ($uncoveredPrefixes.Count -gt 0) {
 
 if ($verifiedAppPrefixes.Count -eq 0) {
     Write-Host "ERROR: no application route could be prepared. No new changes were kept."
+    if ($dnsMode -eq "System" -and $unresolvedDomains.Count -eq $allRuntimeDomains.Count) {
+        Write-Host "Windows DNS returned no usable IPv4 addresses for any managed service. DNS timeouts and synthetic addresses cannot be used to create direct routes."
+    }
     Rollback-CurrentRun $createdRoutes
     exit 1
 }
@@ -2820,81 +2799,45 @@ foreach ($domain in $zoteroWebDavDomains) {
 }
 $effectiveNamespaces = @($effectiveNamespaces | Where-Object { -not (Test-VpnOnlyDomain $_) } | Select-Object -Unique)
 
-$script:PreviousManagedNrptRules = @(
-    Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Comment -eq $NrptComment -or
-            [string]$_.Name -in @($savedNrptRuleNames)
-        } |
-        ForEach-Object {
-            [pscustomobject]@{
-                Namespace = @([string[]]$_.Namespace)
-                NameServers = @([string[]]$_.NameServers)
-                DisplayName = [string]$_.DisplayName
-            }
-        }
-)
-Write-Host ""
-Write-Host "Installing conditional DNS rules for managed service namespaces..."
-$script:NrptTouched = $true
-try {
-    $createdNrptNames = @(Sync-ManagedNrptRules `
-        -Namespaces $effectiveNamespaces `
-        -NameServers $workingDnsServers `
-        -PreviousRuleNames $savedNrptRuleNames)
-    Clear-DnsClientCache -ErrorAction SilentlyContinue
-} catch {
-    Write-Host "ERROR: could not install NRPT rules: $($_.Exception.Message)"
-    Rollback-CurrentRun $createdRoutes
-    exit 1
-}
-
-$dnsVerificationNames = @("yougile.com", "pachca.com", "api.disk-o.cloud", "yandex.ru", "bitrix24.ru")
-if ($nextcloudDomain) { $dnsVerificationNames += $nextcloudDomain }
-$dnsVerificationErrors = @()
-foreach ($domain in $dnsVerificationNames) {
+if ($dnsMode -ne "System") {
+    Write-Host ""
+    Write-Host "Installing conditional DNS rules for managed service namespaces..."
+    $script:NrptTouched = $true
     try {
-        $answer = Resolve-DnsName `
-            -Name $domain `
-            -Type A `
-            -DnsOnly `
-            -QuickTimeout `
-            -ErrorAction Stop |
-            Where-Object { $_.Type -eq "A" -and $_.IPAddress }
-        if (-not $answer) { $dnsVerificationErrors += $domain }
+        $createdNrptNames = @(Sync-ManagedNrptRules `
+            -Namespaces $effectiveNamespaces `
+            -NameServers $workingDnsServers `
+            -PreviousRuleNames $savedNrptRuleNames)
+        Clear-DnsClientCache -ErrorAction SilentlyContinue
     } catch {
-        $dnsVerificationErrors += $domain
+        Write-Host "ERROR: could not install NRPT rules: $($_.Exception.Message)"
+        Rollback-CurrentRun $createdRoutes
+        exit 1
     }
-}
-if ($dnsVerificationErrors.Count -gt 0) {
-    Write-Host "ERROR: effective system DNS verification failed: $($dnsVerificationErrors -join ', ')"
-    Write-Host "A VPN policy or corporate NRPT policy may be overriding the local rules."
-    Rollback-CurrentRun $createdRoutes
-    exit 1
-}
 
-# Self-hosted and dynamic-DNS hosts (Zotero WebDAV, custom sites) and the
-# explicitly listed hosts under the bypassed suffixes are checked separately and
-# never roll the run back: one temporarily offline site must not discard a
-# working configuration for every other service. Hosts discovered in the DNS
-# cache are left out - they are opportunistic and already reported per group.
-$softVerificationNames = @(
-    $zoteroWebDavDomains + $normalizedCustomSites + $bypassSeedDomains +
-        $bitrixDesktopDomains + $elementDomains |
-        Select-Object -Unique
-)
-foreach ($domain in $softVerificationNames) {
-    try {
-        $answer = Resolve-DnsName `
-            -Name $domain `
-            -Type A `
-            -DnsOnly `
-            -QuickTimeout `
-            -ErrorAction Stop |
-            Where-Object { $_.Type -eq "A" -and $_.IPAddress }
-        if (-not $answer) { throw "no A record" }
-    } catch {
-        Write-Host "WARNING: $domain did not resolve; its bypass may be incomplete."
+    $dnsVerificationNames = @("yougile.com", "pachca.com", "api.disk-o.cloud", "yandex.ru", "bitrix24.ru")
+    if ($nextcloudDomain) { $dnsVerificationNames += $nextcloudDomain }
+    $dnsVerificationErrors = @($dnsVerificationNames | Where-Object {
+        @(Resolve-Ips -Domain $_ -DnsServers @()).Count -eq 0
+    })
+    if ($dnsVerificationErrors.Count -gt 0) {
+        Write-Host "ERROR: effective system DNS verification failed: $($dnsVerificationErrors -join ', ')"
+        Write-Host "A VPN policy or corporate NRPT policy may be overriding the local rules."
+        Rollback-CurrentRun $createdRoutes
+        exit 1
+    }
+
+    # Report unavailable optional services after installing NRPT. In System mode
+    # the earlier lookup already reported all unavailable domains.
+    $softVerificationNames = @(
+        $zoteroWebDavDomains + $normalizedCustomSites + $bypassSeedDomains +
+            $bitrixDesktopDomains + $elementDomains |
+            Select-Object -Unique
+    )
+    foreach ($domain in $softVerificationNames) {
+        if (@(Resolve-Ips -Domain $domain -DnsServers @()).Count -eq 0) {
+            Write-Host "WARNING: $domain did not resolve; its bypass may be incomplete."
+        }
     }
 }
 
@@ -2950,6 +2893,10 @@ foreach ($route in $previousManagedRoutes) {
         $lastSeen.ToUniversalTime() -ge $retentionCutoff -and
         $adoptableRouteIndex.ContainsKey($identity)
     )
+    if ($route.Kind -eq "DNS" -or
+        ($route.Prefix -like "*/32" -and -not (Test-MonitorIpv4 ($route.Prefix -split '/', 2)[0]))) {
+        $canRetain = $false
+    }
     # Explicitly removed user entries must stop bypassing after re-apply,
     # while still retaining rotating addresses of configured hosts for 24h.
     if ($route.Kind -eq "Custom IP networks" -and $route.Prefix -notin @($userConfig.Prefixes)) {
@@ -3035,7 +2982,11 @@ try {
 
 Write-Host ""
 Write-Host "Done. $($verifiedAppPrefixes.Count) application route(s) bypass the VPN via LAN/Wi-Fi."
-Write-Host "DNS mode: $dnsMode; resolver(s): $($workingDnsServers -join ', ')."
+if ($dnsMode -eq "System") {
+    Write-Host "DNS mode: System (Windows DNS; no split-tunnel NRPT rules)."
+} else {
+    Write-Host "DNS mode: $dnsMode; resolver(s): $($workingDnsServers -join ', ')."
+}
 if ($zoteroWebDavDomains.Count -gt 0) {
     Write-Host "Zotero WebDAV bypass active for: $($zoteroWebDavDomains -join ', ')."
 }
