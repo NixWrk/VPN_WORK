@@ -35,6 +35,7 @@ param(
     [switch]$Status,
     [switch]$Remove,
     [Parameter(DontShow = $true)][switch]$Reapply,
+    [Parameter(DontShow = $true)][switch]$Migrate,
     [Parameter(DontShow = $true)][switch]$Guided,
     [Parameter(DontShow = $true)][switch]$ChooseVpn,
     [Parameter(DontShow = $true)][switch]$Packaged,
@@ -50,6 +51,8 @@ $TaskName = 'VPN_WORK GPT VPN guard'
 $RuntimeRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'VPN_WORK'
 $RuntimeFiles = @('gpt_vpn_guard.ps1', 'gpt_vpn_guard_watch.ps1', 'gpt_vpn_filter.cs')
 $PolicyFileName = 'guard-policy.json'
+$ManualOnlyPath = Join-Path $RuntimeRoot 'guard-manual-only'
+$LegacySetupLockPath = Join-Path $RuntimeRoot 'guard-setup.lock'
 $configDirectory = if ($Packaged) { Join-Path $env:LOCALAPPDATA 'VPN_WORK' } else { $PSScriptRoot }
 $ConfigPath = Join-Path $configDirectory 'gpt_vpn_guard.local.json'
 
@@ -244,6 +247,42 @@ function Read-ApprovedGuardPolicy {
     return Read-GuardConfig (Join-Path $Runtime $PolicyFileName)
 }
 
+function Read-GuardPolicyForMigration {
+    param($Task)
+
+    if ($Task) {
+        if ($Task.Settings.Enabled -eq $false -or
+            -not @($Task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -and $_.Enabled -ne $false }).Count) {
+            return
+        }
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent()
+        # The ScheduledTasks provider can shorten Principal.UserId to a local
+        # account name. The registered XML retains the canonical account SID.
+        $registered = [xml](Export-ScheduledTask -TaskName $TaskName -TaskPath '\')
+        $owner = [string]$registered.Task.Principals.Principal.UserId
+        $action = $Task.Actions[0]
+        $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+        $runtime = [string]$action.WorkingDirectory
+        if ($owner -notin @($user.Name, $user.User.Value) -or
+            $action.Execute -ne $powershell -or -not $runtime -or
+            $action.Arguments.IndexOf(('-File "' + (Join-Path $runtime 'gpt_vpn_guard_watch.ps1') + '"'),
+                [StringComparison]::OrdinalIgnoreCase) -lt 0) { return }
+        if (Test-GuardRuntimePath $runtime) { return Read-ApprovedGuardPolicy $runtime }
+    } elseif ((Test-Path -LiteralPath $ManualOnlyPath) -or (Test-Path -LiteralPath $LegacySetupLockPath)) {
+        return
+    }
+
+    # Older versions did not save an approved policy. Preserve the actual
+    # restrictions from WFP, including an intentional block-all setting.
+    $installed = [GptVpnFilter]::ReadInstalledPolicy()
+    if (-not $installed.FilterCount) { return }
+    $privateBun = Join-Path $env:USERPROFILE '.codex-chatgpt-web\versions\'
+    $programs = @($installed.Programs | Where-Object { -not $_.StartsWith($privateBun, [StringComparison]::OrdinalIgnoreCase) })
+    $mode = if ($installed.Adapters.Count) { 'adapters' } else { 'blockall' }
+    if ($mode -eq 'blockall') { Write-Host 'У старой защиты сохранилась только блокировка. Она будет перенесена без разрешения внешнего доступа.' }
+    return [pscustomobject]@{ Mode = $mode; Adapters = @($installed.Adapters | ForEach-Object { $_.ToString() }); Programs = $programs }
+}
+
 function Publish-GuardRuntime {
     param([string]$Mode, [string[]]$Adapters, [string[]]$Programs)
 
@@ -285,7 +324,7 @@ function Publish-GuardRuntime {
 function Open-GuardSetupLock {
     [void][IO.Directory]::CreateDirectory($RuntimeRoot)
     Assert-GuardRuntimeItem $RuntimeRoot
-    $path = Join-Path $RuntimeRoot 'guard-setup.lock'
+    $path = Join-Path $RuntimeRoot 'guard-operation.lock'
     if (Test-Path -LiteralPath $path) { Assert-GuardRuntimeItem $path }
     try { return [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'None') }
     catch [IO.IOException] { throw "Could not lock GPT VPN setup: $($_.Exception.Message)" }
@@ -381,14 +420,15 @@ if ($Help) {
 $setupLock = $null
 try {
     $selection = $BlockAll -or $Guided -or $Auto -or $VpnAdapter -or $Program -or $ChooseVpn -or $NoStartup
-    if ((($Status -or $Remove -or $Reapply) -and ($Plan -or $selection)) -or
-        @(@($Status, $Remove, $Reapply) | Where-Object { $_ }).Count -gt 1) {
-        throw 'Use -Status, -Remove or -Reapply on its own.'
+    if ((($Status -or $Remove -or $Reapply -or $Migrate) -and ($Plan -or $selection)) -or
+        @(@($Status, $Remove, $Reapply, $Migrate) | Where-Object { $_ }).Count -gt 1) {
+        throw 'Incompatible guard operations.'
     }
     if (($ChooseVpn -and -not $Guided) -or ($Guided -and $BlockAll)) { throw 'Incompatible VPN selection modes.' }
 
     $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($Migrate -and (-not $Packaged -or -not $admin)) { throw 'Guard migration must run from the elevated launcher.' }
     if (-not $Plan -and -not $Reapply -and -not $admin) {
         if ($PSBoundParameters.ContainsKey('Program') -or $VpnAdapter) {
             throw 'Open PowerShell as Administrator when passing -VpnAdapter or -Program, or set them in gpt_vpn_guard.local.json.'
@@ -420,6 +460,7 @@ try {
                 Unregister-ScheduledTask -InputObject $oldTask -Confirm:$false | Out-Null
             }
             Write-Host "Removed GPT VPN filters: $([GptVpnFilter]::Remove())"
+            if (Test-Path -LiteralPath $ManualOnlyPath) { Remove-Item -LiteralPath $ManualOnlyPath -Force }
             exit 0
         }
 
@@ -437,9 +478,16 @@ try {
         exit 0
     }
 
-    $config = if ($Reapply) { Read-ApprovedGuardPolicy $PSScriptRoot } else {
+    if ($Migrate) {
+        $setupLock = Open-GuardSetupLock
+        if (-not ('GptVpnFilter' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs') }
+        $oldTask = Get-GuardStartup
+        $config = Read-GuardPolicyForMigration $oldTask
+        if (-not $config) { exit 3 }
+        $oldRuntime = if ($oldTask) { [string]$oldTask.Actions[0].WorkingDirectory }
+    } elseif ($Reapply) { $config = Read-ApprovedGuardPolicy $PSScriptRoot } else {
         $draft = Read-GuardConfig -Path $ConfigPath
-        if ($draft) { $draft } elseif (Test-GuardRuntimePath $oldRuntime) { Read-ApprovedGuardPolicy $oldRuntime }
+        $config = if ($draft) { $draft } elseif (Test-GuardRuntimePath $oldRuntime) { Read-ApprovedGuardPolicy $oldRuntime }
     }
     $mode = if ($config) { $config.Mode } else { 'auto' }
     $savedAdapters = if ($config) { @($config.Adapters) } else { @() }
@@ -463,7 +511,7 @@ try {
     $adapters = @(switch ($mode) {
         'blockall' { }
         'adapters' {
-            $approvedGuids = @(Resolve-ApprovedVpnGuids -Adapters $allAdapters -Requested $savedAdapters -Refresh:$Reapply)
+            $approvedGuids = @(Resolve-ApprovedVpnGuids -Adapters $allAdapters -Requested $savedAdapters -Refresh:($Reapply -or $Migrate))
             Get-VpnPathAdapters -Adapters $allAdapters | Where-Object {
                 $_.Status -eq 'Up' -and ([guid]$_.InterfaceGuid).ToString() -in $approvedGuids
             }
@@ -487,15 +535,33 @@ try {
 
     if (-not ('GptVpnFilter' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs') }
     if (-not $Reapply) {
-        $setupLock = Open-GuardSetupLock
-        $oldTask = Get-GuardStartup
+        if (-not $setupLock) {
+            $setupLock = Open-GuardSetupLock
+            $oldTask = Get-GuardStartup
+        }
         if (-not $NoStartup) {
             $runtime = Publish-GuardRuntime -Mode $mode -Adapters $approvedGuids -Programs @($Program)
         }
         Stop-GuardStartup
         if ($NoStartup) {
+            if (-not (Test-Path -LiteralPath $ManualOnlyPath)) {
+                New-Item -Path $ManualOnlyPath -ItemType File | Out-Null
+            }
             if ($oldTask) { Unregister-ScheduledTask -InputObject $oldTask -Confirm:$false | Out-Null }
-        } else { Register-GuardStartup -Runtime $runtime }
+        } else {
+            try { Register-GuardStartup -Runtime $runtime }
+            catch {
+                if ($Migrate -and (Test-GuardRuntimePath $oldRuntime)) {
+                    $previous = Get-GuardStartup
+                    if ($previous -and $previous.Actions[0].WorkingDirectory -eq $oldRuntime) {
+                        Enable-ScheduledTask -InputObject $previous | Out-Null
+                        Start-ScheduledTask -InputObject $previous
+                    }
+                }
+                throw
+            }
+            if (Test-Path -LiteralPath $ManualOnlyPath) { Remove-Item -LiteralPath $ManualOnlyPath -Force }
+        }
     }
 
     $guids = @($adapters | ForEach-Object { [guid]$_.InterfaceGuid })

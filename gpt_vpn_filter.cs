@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -15,6 +16,7 @@ public static class GptVpnFilter
     private static readonly Guid PackageId = new Guid("71bc78fa-f17c-4997-a602-6abb261f351c");
     private static readonly Guid Flags = new Guid("632ce23b-5167-435c-86d7-e903684aa80c");
     private static readonly Guid NextHopInterface = new Guid("93ae8f5b-7f6f-4719-98c8-14e97429ef04");
+    private static readonly Guid LegacyLocalInterface = new Guid("4cd62a49-59c3-4969-b7f3-bda5d32890a4");
     private const uint Persistent = 1, Block = 0x1001, SoftPermit = 0x1002;
     private const uint AlreadyExists = 0x80320009, NoSublayer = 0x80320007;
     private const uint Equal = 0, FlagsAllSet = 6, MatchSuffix = 11; // SDK: FWP_MATCH_PREFIX
@@ -54,6 +56,7 @@ public static class GptVpnFilter
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmTransactionCommit0(IntPtr engine);
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmTransactionAbort0(IntPtr engine);
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmSubLayerAdd0(IntPtr engine, ref Sublayer layer, IntPtr security);
+    [DllImport("fwpuclnt.dll")] private static extern uint FwpmSubLayerGetByKey0(IntPtr engine, ref Guid key, out IntPtr layer);
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmSubLayerDeleteByKey0(IntPtr engine, ref Guid key);
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmFilterCreateEnumHandle0(IntPtr engine, IntPtr template, out IntPtr handle);
     [DllImport("fwpuclnt.dll")] private static extern uint FwpmFilterEnum0(IntPtr engine, IntPtr handle, uint limit, out IntPtr entries, out uint count);
@@ -63,6 +66,7 @@ public static class GptVpnFilter
     [DllImport("fwpuclnt.dll")] private static extern void FwpmFreeMemory0(ref IntPtr memory);
     [DllImport("fwpuclnt.dll", CharSet = CharSet.Unicode)] private static extern uint FwpmGetAppIdFromFileName0(string path, out IntPtr blob);
     [DllImport("iphlpapi.dll")] private static extern uint ConvertInterfaceGuidToLuid(ref Guid guid, out ulong luid);
+    [DllImport("iphlpapi.dll")] private static extern uint ConvertInterfaceLuidToGuid(ref ulong luid, out Guid guid);
     [DllImport("userenv.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] private static extern uint DeriveAppContainerSidFromAppContainerName(string family, out IntPtr sid);
     [DllImport("advapi32.dll")] private static extern IntPtr FreeSid(IntPtr sid);
 
@@ -85,7 +89,7 @@ public static class GptVpnFilter
         return engine;
     }
 
-    private static List<Guid> OwnedFilters(IntPtr engine)
+    private static List<Guid> OwnedFilters(IntPtr engine, System.Action<IntPtr> inspect = null)
     {
         var keys = new List<Guid>();
         IntPtr handle;
@@ -99,8 +103,10 @@ public static class GptVpnFilter
                 try {
                     for (int i = 0; i < count; i++) {
                         IntPtr filter = Marshal.ReadIntPtr(entries, i * IntPtr.Size);
-                        if ((Guid)Marshal.PtrToStructure(IntPtr.Add(filter, sublayerOffset), typeof(Guid)) == Owner)
+                        if ((Guid)Marshal.PtrToStructure(IntPtr.Add(filter, sublayerOffset), typeof(Guid)) == Owner) {
                             keys.Add((Guid)Marshal.PtrToStructure(filter, typeof(Guid)));
+                            if (inspect != null) inspect(filter);
+                        }
                     }
                 } finally { if (entries != IntPtr.Zero) FwpmFreeMemory0(ref entries); }
             } while (count == 256);
@@ -156,6 +162,64 @@ public static class GptVpnFilter
         IntPtr engine = Open();
         try { return OwnedFilters(engine).Count; }
         finally { FwpmEngineClose0(engine); }
+    }
+
+    public static bool HasInstallation()
+    {
+        IntPtr engine = Open();
+        try {
+            Guid key = Owner;
+            IntPtr layer;
+            uint code = FwpmSubLayerGetByKey0(engine, ref key, out layer);
+            if (code == 0) FwpmFreeMemory0(ref layer);
+            // The launcher may find the sublayer without permission to read it.
+            // Elevated migration confirms owned filters before making changes.
+            if (code == NoSublayer) return false;
+            if (code != 5) Check(code, "Find GPT VPN sublayer");
+            return true;
+        } finally { FwpmEngineClose0(engine); }
+    }
+
+    public sealed class InstalledPolicy
+    {
+        public int FilterCount { get; internal set; }
+        public Guid[] Adapters { get; internal set; }
+        public string[] Programs { get; internal set; }
+    }
+
+    public static InstalledPolicy ReadInstalledPolicy()
+    {
+        const string blockPrefix = "GPT VPN: block outside VPN / ";
+        var programs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var adapters = new HashSet<Guid>();
+        int conditionSize = Marshal.SizeOf(typeof(Condition));
+        IntPtr engine = Open();
+        try {
+            var filters = OwnedFilters(engine, pointer => {
+                var filter = (Filter)Marshal.PtrToStructure(pointer, typeof(Filter));
+                if (filter.Action.Type == Block && filter.Display.Name != null &&
+                    filter.Display.Name.StartsWith(blockPrefix, StringComparison.Ordinal)) {
+                    string target = filter.Display.Name.Substring(blockPrefix.Length);
+                    if (Path.IsPathRooted(target) && target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        programs.Add(target);
+                }
+                if (filter.Action.Type != SoftPermit || (filter.Flags & Persistent) != 0) return;
+                for (int i = 0; i < filter.Count; i++) {
+                    var condition = (Condition)Marshal.PtrToStructure(IntPtr.Add(filter.Conditions, i * conditionSize), typeof(Condition));
+                    if ((condition.Key != NextHopInterface && condition.Key != LegacyLocalInterface) ||
+                        condition.Match != Equal || condition.Value.Type != UInt64 || condition.Value.Data == IntPtr.Zero) continue;
+                    ulong luid = unchecked((ulong)Marshal.ReadInt64(condition.Value.Data));
+                    Guid adapter;
+                    if (ConvertInterfaceLuidToGuid(ref luid, out adapter) == 0 && adapter != Guid.Empty)
+                        adapters.Add(adapter);
+                }
+            });
+            var adapterList = new List<Guid>(adapters);
+            var programList = new List<string>(programs);
+            adapterList.Sort();
+            programList.Sort(StringComparer.OrdinalIgnoreCase);
+            return new InstalledPolicy { FilterCount = filters.Count, Adapters = adapterList.ToArray(), Programs = programList.ToArray() };
+        } finally { FwpmEngineClose0(engine); }
     }
 
     // A single transaction replaces both address families, or keeps the old policy intact.

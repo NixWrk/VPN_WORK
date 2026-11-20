@@ -27,6 +27,11 @@ internal static class Program
                 Install(InstallRoot);
                 return 0;
             }
+            if (args.Length == 1 && args[0] == "--migrate-guard") {
+                if (!IsElevated()) throw new UnauthorizedAccessException("Для переноса защиты нужны права администратора.");
+                if (!GuardUpgrade.IsRequired(InstallRoot, ReadResource)) return 3;
+                return RunInstalledScript(Install(InstallRoot), "gpt_vpn_guard.ps1", "-Packaged -Migrate");
+            }
             if (args.Length == 1 && args[0] == "--verify") {
                 foreach (string name in Files) Console.WriteLine(name + " " + Hash(ReadResource(name)));
                 Console.WriteLine("Payload version: " + PayloadVersion());
@@ -45,6 +50,7 @@ internal static class Program
             if (skipUpdate && args[0] == "--update-failed")
                 Console.WriteLine("Обновление не установилось. Сохранена предыдущая версия.");
             if (!skipUpdate && !Console.IsInputRedirected && !File.Exists(NoAutoUpdate) && !IsElevated() && TryUpdate(false)) return 0;
+            if (Environment.UserInteractive && !Console.IsInputRedirected) UpgradeGuardAtStartup();
             return RunMenu(RunScript);
         } catch (Exception error) {
             Console.Error.WriteLine(error.Message);
@@ -286,13 +292,42 @@ internal static class Program
 
     private static int RunScript(string name, string arguments)
     {
-        string directory = EnsureInstalled();
+        return RunInstalledScript(EnsureInstalled(), name, arguments);
+    }
+
+    private static int RunInstalledScript(string directory, string name, string arguments)
+    {
         string powershell = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
         var start = new ProcessStartInfo(powershell, "-NoLogo -NoProfile -ExecutionPolicy Bypass -File " +
             Quote(Path.Combine(directory, name)) + " " + arguments) {
             UseShellExecute = false, WorkingDirectory = directory
         };
         using (Process child = Process.Start(start)) { child.WaitForExit(); return child.ExitCode; }
+    }
+
+    private static void UpgradeGuardAtStartup()
+    {
+        try {
+            if (!GuardUpgrade.IsRequired(InstallRoot, ReadResource)) return;
+            Console.WriteLine("Переношу уже включённую защиту ChatGPT и Codex в новую версию.");
+            int code;
+            if (IsElevated()) {
+                code = RunInstalledScript(Install(InstallRoot), "gpt_vpn_guard.ps1", "-Packaged -Migrate");
+            } else {
+                Console.WriteLine("Подтвердите запрос Windows на обновление фоновой задачи.");
+                var start = new ProcessStartInfo(Assembly.GetExecutingAssembly().Location, "--migrate-guard") {
+                    UseShellExecute = true, Verb = "runas", WorkingDirectory = Environment.SystemDirectory
+                };
+                using (Process child = Process.Start(start)) { child.WaitForExit(); code = child.ExitCode; }
+            }
+            if (code == 0) Console.WriteLine("Защита перенесена. Автовосстановление при входе в Windows включено.");
+            else if (code != 3) Console.WriteLine("Не удалось перенести защиту. Код " + code + ".");
+        } catch (Win32Exception error) {
+            if (error.NativeErrorCode == 1223) Console.WriteLine("Перенос защиты отложен до следующего запуска VPN_WORK.");
+            else Console.WriteLine("Не удалось перенести защиту. " + error.Message);
+        } catch (Exception error) {
+            Console.WriteLine("Не удалось проверить или перенести защиту. " + error.Message);
+        }
     }
 
     private static string EnsureInstalled()

@@ -189,7 +189,31 @@ exit $LASTEXITCODE
         throw "Invalid executable accepted: $($invalidProgram.Output)"
     }
 
-    Write-Host 'PASS: default and split-default routes, IPv6, no automatic overlay trust, explicit and legacy selection, and fail-closed planning'
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
+    $migration = $ast.EndBlock.Statements | Where-Object Name -eq 'Read-GuardPolicyForMigration'
+    . ([scriptblock]::Create($migration.Extent.Text))
+    $TaskName = 'test guard'
+    $script:taskOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    function Export-ScheduledTask {
+        param([string]$TaskName, [string]$TaskPath)
+        return "<Task><Principals><Principal><UserId>$script:taskOwner</UserId></Principal></Principals></Task>"
+    }
+    function Test-GuardRuntimePath { return $true }
+    function Read-ApprovedGuardPolicy { return @{ Mode = 'adapters'; Programs = @($browser) } }
+    $scheduled = [pscustomobject]@{
+        Settings = @{ Enabled = $true }
+        Triggers = @(@{ Enabled = $true; CimClass = @{ CimClassName = 'MSFT_TaskLogonTrigger' } })
+        Principal = @{ UserId = 'short-account-name' }
+        Actions = @(@{ Execute = (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe')
+            WorkingDirectory = $absolute; Arguments = "-File `"$absolute\gpt_vpn_guard_watch.ps1`"" })
+    }
+    $migrated = Read-GuardPolicyForMigration $scheduled
+    if ($migrated.Mode -ne 'adapters' -or $migrated.Programs[0] -ne $browser) { throw 'Approved migration policy was not preserved.' }
+    $script:taskOwner = 'S-1-0-0'
+    if (Read-GuardPolicyForMigration $scheduled) { throw 'Another user task was accepted.' }
+
+    Write-Host 'PASS: VPN route selection, fail-closed planning, and migration preserving approved policy and task ownership'
 } finally {
     if (Test-Path -LiteralPath $absolute) { Remove-Item -LiteralPath $absolute -Recurse -Force }
 }

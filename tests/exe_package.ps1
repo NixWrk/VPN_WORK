@@ -14,7 +14,7 @@ try {
     foreach ($name in ($components + @('build_exe.ps1', 'VERSION'))) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination $build
     }
-    foreach ($name in 'Program.cs', 'Updater.cs', 'BrowserProxy.cs', 'BrowserLan.cs', 'InstallUpdate.ps1') {
+    foreach ($name in 'Program.cs', 'Updater.cs', 'BrowserProxy.cs', 'BrowserLan.cs', 'GuardUpgrade.cs', 'InstallUpdate.ps1') {
         Copy-Item -LiteralPath (Join-Path (Join-Path $root 'launcher') $name) -Destination (Join-Path $build 'launcher')
     }
     $exe = Join-Path $case 'Standalone copy\VPN_WORK.exe'
@@ -103,6 +103,35 @@ try {
     [void][IO.Directory]::CreateDirectory((Split-Path $stagedRoot))
     $payload = $stage.Invoke($stagedRoot)
     if ($payload -ne $stage.Invoke($stagedRoot)) { throw 'Staging is not idempotent.' }
+
+    $needsMigration = [Delegate]::CreateDelegate([Func[string,string,string,string,Func[string,byte[]],bool]],
+        $assembly.GetType('GuardUpgrade').GetMethod('NeedsTaskUpgrade', $flags))
+    $guardFiles = @('gpt_vpn_guard.ps1', 'gpt_vpn_guard_watch.ps1', 'gpt_vpn_filter.cs')
+    $resource = [Delegate]::CreateDelegate([Func[string,byte[]]], $program.GetMethod('ReadResource', $flags))
+    $installedRuntime = Join-Path $stagedRoot ('guard-' + ('f' * 64))
+    [void][IO.Directory]::CreateDirectory($installedRuntime)
+    foreach ($name in $guardFiles) { Copy-Item -LiteralPath (Join-Path $payload $name) -Destination $installedRuntime }
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $owner = 'S-1-5-21-1-2-3-1001'
+    function Test-TaskMigration([string]$Directory, [string]$TaskOwner = $owner, [string]$Enabled = 'true', [string]$TriggerEnabled = 'true') {
+        $Directory = [Security.SecurityElement]::Escape($Directory)
+        $xml = @"
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Principals><Principal><UserId>$TaskOwner</UserId></Principal></Principals>
+<Triggers><LogonTrigger><Enabled>$TriggerEnabled</Enabled></LogonTrigger></Triggers>
+<Settings><Enabled>$Enabled</Enabled></Settings>
+<Actions><Exec><Command>$powershell</Command><WorkingDirectory>$Directory</WorkingDirectory>
+<Arguments>-NoProfile -File "$Directory\gpt_vpn_guard_watch.ps1"</Arguments></Exec></Actions>
+</Task>
+"@
+        return $needsMigration.Invoke($xml, $stagedRoot, $owner, 'PC\test', $resource)
+    }
+    $legacyRuntime = Join-Path $case 'Legacy runtime'
+    if (-not (Test-TaskMigration $legacyRuntime) -or (Test-TaskMigration $installedRuntime) -or
+        (Test-TaskMigration $legacyRuntime -Enabled 'false') -or (Test-TaskMigration $legacyRuntime -TriggerEnabled 'false') -or
+        (Test-TaskMigration $legacyRuntime -TaskOwner 'S-1-5-21-1-2-3-1002')) { throw 'Incorrect decision on startup guard migration.' }
+    [IO.File]::AppendAllText((Join-Path $installedRuntime 'gpt_vpn_guard_watch.ps1'), '# older watcher')
+    if (-not (Test-TaskMigration $installedRuntime)) { throw 'An outdated protected watcher was missed.' }
     $env:LOCALAPPDATA = Join-Path $case 'Test Local Application Data'
     $data = Join-Path $env:LOCALAPPDATA 'VPN_WORK'
     [void][IO.Directory]::CreateDirectory($data)
@@ -128,7 +157,7 @@ try {
         $rejected = $_.Exception.GetBaseException() -is [IO.IOException]
     }
     if (-not $rejected) { throw 'A modified installed script was accepted.' }
-    Write-Host 'PASS: standalone EXE, automatic/manual actions, update preference and release validation, local configs, altered payload rejection'
+    Write-Host 'PASS: standalone EXE, menu actions, guard migration detection, update preference and release validation, local configs, altered payload rejection'
 } finally {
     $env:LOCALAPPDATA = $originalData
     if (Test-Path -LiteralPath $case) { Remove-Item -LiteralPath $case -Recurse -Force }
