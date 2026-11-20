@@ -10,7 +10,7 @@ using System.Text;
 internal static class Program
 {
     private static readonly string[] Files = {
-        "split_tunnel.ps1", "gpt_vpn_guard.ps1", "gpt_vpn_filter.cs", "zotero_proxy.ps1"
+        "split_tunnel.ps1", "gpt_vpn_guard.ps1", "gpt_vpn_guard_watch.ps1", "gpt_vpn_filter.cs", "zotero_proxy.ps1"
     };
     private static readonly string InstallRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VPN_WORK");
@@ -76,9 +76,9 @@ internal static class Program
     {
         Console.WriteLine("\nАвтоматическая настройка");
         Console.WriteLine("• Избранные рабочие сайты, PubMed и Element будут работать мимо VPN.");
-        Console.WriteLine("• ChatGPT и Codex смогут выходить в интернет только через выбранный VPN.");
-        Console.WriteLine("  Подключите VPN. При первом запуске выберите его из списка. Если VPN не найден,");
-        Console.WriteLine("  этот шаг будет пропущен, а прежняя защита останется без изменений.");
+        Console.WriteLine("• ChatGPT и Codex смогут выходить в интернет только через разрешённый VPN.");
+        Console.WriteLine("  Используется утверждённая настройка. По умолчанию VPN определяется по маршрутам Windows.");
+        Console.WriteLine("  Защита восстановит разрешения при входе в Windows и подключении VPN.");
         Console.WriteLine("• Прокси Zotero обновится, только если уже настроен и Zotero закрыт.");
         if (!Confirm("1  Применить настройки    0  Назад")) return;
         int routes = RunAction(run, "split_tunnel.ps1", "-Packaged");
@@ -87,7 +87,6 @@ internal static class Program
         Console.WriteLine("\nРезультат автоматической настройки:");
         Console.WriteLine("  Обход VPN: " + Result(routes));
         Console.WriteLine("  Защита ChatGPT и Codex: " + Result(guard));
-        if (guard == 3) Console.WriteLine("    Чтобы включить её, подключите VPN и повторите настройку.");
         Console.WriteLine("  Прокси Zotero: " + Result(zotero));
         if (zotero == 3) Console.WriteLine("    Новый прокси можно включить вручную, если Zotero плохо синхронизируется.");
     }
@@ -165,21 +164,23 @@ internal static class Program
     {
         for (;;) {
             Console.WriteLine("\nЗащита ChatGPT и Codex");
-            Console.WriteLine("1  Выбрать VPN и включить защиту — сначала подключите нужный VPN");
-            Console.WriteLine("2  Дополнительные программы — добавить, например, отдельный браузер целиком");
-            Console.WriteLine("3  Проверить состояние — показать, установлены ли правила защиты");
-            Console.WriteLine("4  Заблокировать весь внешний доступ — до повторного выбора VPN");
-            Console.WriteLine("5  Снять защиту — снова разрешить подключение без VPN");
+            Console.WriteLine("1  Включить защиту — определить VPN по маршрутам Windows");
+            Console.WriteLine("2  Выбрать VPN вручную — показать все интерфейсы и выбрать туннели");
+            Console.WriteLine("3  Дополнительные программы — добавить, например, отдельный браузер целиком");
+            Console.WriteLine("4  Проверить состояние — показать правила, фоновую задачу и интерфейсы");
+            Console.WriteLine("5  Заблокировать весь внешний доступ — до смены режима защиты");
+            Console.WriteLine("6  Снять защиту — снова разрешить подключение без VPN");
             Console.WriteLine("0  Назад");
             switch (ReadChoice()) {
-                case "1": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Guided -ChooseVpn"); break;
-                case "2": RunAction((name, args) => { EditGuardConfig(); return 0; }, "", ""); break;
-                case "3": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Status"); break;
-                case "4":
+                case "1": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Auto"); break;
+                case "2": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Guided -ChooseVpn"); break;
+                case "3": RunAction((name, args) => { EditGuardConfig(); return 0; }, "", ""); break;
+                case "4": RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Status"); break;
+                case "5":
                     if (Confirm("1  Заблокировать весь внешний доступ этих приложений    0  Назад"))
                         RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -BlockAll");
                     break;
-                case "5":
+                case "6":
                     if (Confirm("1  Снять защиту    0  Назад")) RunAction(run, "gpt_vpn_guard.ps1", "-Packaged -Remove");
                     break;
                 case "0": return;
@@ -271,14 +272,16 @@ internal static class Program
         if (!File.Exists(file)) {
             using (var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write))
             using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
-                writer.Write("{\r\n  \"VpnAdapter\": \"\",\r\n  \"Programs\": []\r\n}\r\n");
+                writer.Write("{\r\n  \"Mode\": \"auto\",\r\n  \"VpnAdapters\": [],\r\n  \"Programs\": []\r\n}\r\n");
         }
         using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "notepad.exe"),
             Quote(file)) { UseShellExecute = true })) { }
         Console.WriteLine("Настройки: " + file);
-        Console.WriteLine("В Programs укажите полные пути к .exe. В JSON обратная косая черта записывается как \\\\.");
+        Console.WriteLine("Режим auto проверяет маршруты Windows, adapters использует VpnAdapters, blockall блокирует внешний доступ.");
+        Console.WriteLine("В VpnAdapters укажите имена или GUID из Get-NetAdapter. В Programs — полные пути к .exe.");
+        Console.WriteLine("В JSON обратная косая черта записывается как \\\\.");
         Console.WriteLine("Весь добавленный браузер будет работать только через VPN, включая остальные вкладки.");
-        Console.WriteLine("После сохранения снова выберите VPN и включите защиту.");
+        Console.WriteLine("После сохранения снова включите защиту.");
     }
 
     private static int RunScript(string name, string arguments)

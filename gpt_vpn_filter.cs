@@ -14,8 +14,7 @@ public static class GptVpnFilter
     private static readonly Guid AppId = new Guid("d78e1e87-8644-4ea5-9437-d809ecefc971");
     private static readonly Guid PackageId = new Guid("71bc78fa-f17c-4997-a602-6abb261f351c");
     private static readonly Guid Flags = new Guid("632ce23b-5167-435c-86d7-e903684aa80c");
-    private static readonly Guid NextHop = new Guid("93ae8f5b-7f6f-4719-98c8-14e97429ef04");
-    private static readonly Guid LocalInterface = new Guid("4cd62a49-59c3-4969-b7f3-bda5d32890a4");
+    private static readonly Guid NextHopInterface = new Guid("93ae8f5b-7f6f-4719-98c8-14e97429ef04");
     private const uint Persistent = 1, Block = 0x1001, SoftPermit = 0x1002;
     private const uint AlreadyExists = 0x80320009, NoSublayer = 0x80320007;
     private const uint Equal = 0, FlagsAllSet = 6, MatchSuffix = 11; // SDK: FWP_MATCH_PREFIX
@@ -131,7 +130,7 @@ public static class GptVpnFilter
         } finally { Marshal.FreeHGlobal(data); }
     }
 
-    private static void AddTarget(IntPtr engine, string target, Condition identity, IntPtr luid)
+    private static void AddTarget(IntPtr engine, string target, Condition identity, IList<ulong> luids)
     {
         var loopback = Match(Flags, FlagsAllSet, UInt32, new IntPtr(1)); // FWP_CONDITION_FLAG_IS_LOOPBACK
         foreach (Guid layer in Layers) {
@@ -139,11 +138,15 @@ public static class GptVpnFilter
             // providers (Defender Firewall, VPN client, etc.) may still block.
             Add(engine, layer, target, "block outside VPN", Block, 1, true, identity);
             Add(engine, layer, target, "allow local IPC", SoftPermit, 3, true, identity, loopback);
-            if (luid != IntPtr.Zero) {
-                // Do not persist an old tunnel's LUID across BFE restart. Only
-                // the deny policy survives; reapply to verify the VPN again.
-                Add(engine, layer, target, "allow selected VPN", SoftPermit, 2, false, identity,
-                    Match(LocalInterface, Equal, UInt64, luid), Match(NextHop, Equal, UInt64, luid));
+            foreach (ulong luid in luids) {
+                // Match the egress interface WFP selected for the connection.
+                // Permits are rebuilt for the current LUIDs after BFE starts.
+                IntPtr value = Marshal.AllocHGlobal(sizeof(ulong));
+                try {
+                    Marshal.WriteInt64(value, unchecked((long)luid));
+                    Add(engine, layer, target, "allow VPN interface " + luid.ToString("x"), SoftPermit, 2, false,
+                        identity, Match(NextHopInterface, Equal, UInt64, value));
+                } finally { Marshal.FreeHGlobal(value); }
             }
         }
     }
@@ -156,19 +159,21 @@ public static class GptVpnFilter
     }
 
     // A single transaction replaces both address families, or keeps the old policy intact.
-    // An empty adapter GUID installs the block without a tunnel exception.
-    public static int Apply(Guid adapter, string[] executableNames, string[] exactPaths, string[] packages)
+    // An empty adapter list installs the block without any tunnel exception.
+    public static int Apply(Guid[] adapters, string[] executableNames, string[] exactPaths, string[] packages)
     {
         int targets = executableNames.Length + exactPaths.Length + packages.Length;
         if (targets == 0) throw new ArgumentException("No executable targets.");
-        IntPtr engine = Open(), luid = IntPtr.Zero;
+        var luids = new List<ulong>();
+        foreach (Guid item in adapters ?? new Guid[0]) {
+            if (item == Guid.Empty) continue;
+            Guid adapter = item;
+            ulong value;
+            Check(ConvertInterfaceGuidToLuid(ref adapter, out value), "Identify the selected VPN interface");
+            if (!luids.Contains(value)) luids.Add(value);
+        }
+        IntPtr engine = Open();
         try {
-            if (adapter != Guid.Empty) {
-                ulong value;
-                Check(ConvertInterfaceGuidToLuid(ref adapter, out value), "Identify the selected VPN interface");
-                luid = Marshal.AllocHGlobal(sizeof(ulong));
-                Marshal.WriteInt64(luid, unchecked((long)value));
-            }
             Check(FwpmTransactionBegin0(engine, 0), "Start WFP transaction");
             try {
                 var sublayer = new Sublayer { Key = Owner, Flags = Persistent, Weight = UInt16.MaxValue,
@@ -186,7 +191,7 @@ public static class GptVpnFilter
                         Marshal.Copy(bytes, 0, data, bytes.Length);
                         blob = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Blob)));
                         Marshal.StructureToPtr(new Blob { Size = (uint)bytes.Length, Data = data }, blob, false);
-                        AddTarget(engine, name, Match(AppId, MatchSuffix, ByteBlob, blob), luid);
+                        AddTarget(engine, name, Match(AppId, MatchSuffix, ByteBlob, blob), luids);
                     } finally {
                         if (blob != IntPtr.Zero) Marshal.FreeHGlobal(blob);
                         Marshal.FreeHGlobal(data);
@@ -195,25 +200,29 @@ public static class GptVpnFilter
                 foreach (string path in exactPaths) {
                     IntPtr app;
                     Check(FwpmGetAppIdFromFileName0(path, out app), "Get application ID: " + path);
-                    try { AddTarget(engine, path, Match(AppId, Equal, ByteBlob, app), luid); }
+                    try { AddTarget(engine, path, Match(AppId, Equal, ByteBlob, app), luids); }
                     finally { FwpmFreeMemory0(ref app); }
                 }
                 foreach (string family in packages) {
                     IntPtr sid = GetPackageSid(family);
-                    try { AddTarget(engine, family, Match(PackageId, Equal, Sid, sid), luid); }
+                    try { AddTarget(engine, family, Match(PackageId, Equal, Sid, sid), luids); }
                     finally { FreeSid(sid); }
                 }
                 Check(FwpmTransactionCommit0(engine), "Commit GPT VPN policy");
             } catch { FwpmTransactionAbort0(engine); throw; }
             int installed = OwnedFilters(engine).Count;
-            int expected = targets * Layers.Length * (luid == IntPtr.Zero ? 2 : 3);
+            int expected = targets * Layers.Length * (2 + luids.Count);
             if (installed != expected)
                 throw new InvalidOperationException("WFP readback found " + installed + " of " + expected + " expected GPT VPN filters.");
             return installed;
         } finally {
-            if (luid != IntPtr.Zero) Marshal.FreeHGlobal(luid);
             FwpmEngineClose0(engine);
         }
+    }
+
+    public static int Apply(Guid adapter, string[] executableNames, string[] exactPaths, string[] packages)
+    {
+        return Apply(adapter == Guid.Empty ? new Guid[0] : new Guid[] { adapter }, executableNames, exactPaths, packages);
     }
 
     public static int Remove()

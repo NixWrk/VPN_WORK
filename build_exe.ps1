@@ -14,7 +14,7 @@ $temporary = Join-Path ([IO.Path]::GetDirectoryName($output)) ('.vpnwork-' + [gu
 $assemblyInfo = [IO.Path]::ChangeExtension($temporary, 'cs')
 $version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()
 if ($version -notmatch '\A[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\z') { throw 'VERSION must contain major.minor.patch.' }
-$items = @('split_tunnel.ps1', 'gpt_vpn_guard.ps1', 'gpt_vpn_filter.cs', 'zotero_proxy.ps1')
+$items = @('split_tunnel.ps1', 'gpt_vpn_guard.ps1', 'gpt_vpn_guard_watch.ps1', 'gpt_vpn_filter.cs', 'zotero_proxy.ps1')
 $resourceArguments = @($items | ForEach-Object { '/resource:' + (Join-Path $PSScriptRoot $_) + ',' + $_ })
 $resourceArguments += '/resource:' + (Join-Path $PSScriptRoot 'launcher\InstallUpdate.ps1') + ',InstallUpdate.ps1'
 try {

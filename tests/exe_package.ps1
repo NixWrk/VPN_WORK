@@ -7,7 +7,7 @@ if (-not $case.StartsWith($PSScriptRoot + [IO.Path]::DirectorySeparatorChar, [St
     throw 'Temporary packaging path escaped the tests directory.'
 }
 $originalData = $env:LOCALAPPDATA
-$components = @('split_tunnel.ps1', 'gpt_vpn_guard.ps1', 'gpt_vpn_filter.cs', 'zotero_proxy.ps1')
+$components = @('split_tunnel.ps1', 'gpt_vpn_guard.ps1', 'gpt_vpn_guard_watch.ps1', 'gpt_vpn_filter.cs', 'zotero_proxy.ps1')
 try {
     $build = Join-Path $case 'Build sources'
     [void][IO.Directory]::CreateDirectory((Join-Path $build 'launcher'))
@@ -24,7 +24,7 @@ try {
     }
     if (@(Get-ChildItem -LiteralPath (Split-Path $exe) -Force).Count -ne 1) { throw 'Distribution requires extra files.' }
     $lines = @(& $exe --verify)
-    if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 5) { throw "Package verification failed: $lines" }
+    if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 6) { throw "Package verification failed: $lines" }
     foreach ($name in $components) {
         $hash = (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         if ("$name $hash" -notin $lines) { throw "Wrong embedded data: $name" }

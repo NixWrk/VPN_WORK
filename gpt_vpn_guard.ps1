@@ -1,29 +1,40 @@
 ﻿<#
 .SYNOPSIS
 Protects ChatGPT, Codex and explicitly selected Windows executables with a VPN-only network policy.
+.DESCRIPTION
+The automatic mode uses Windows tunnel adapter types and active default or split-default
+routes. Select other trusted VPN interfaces explicitly. Blocking rules persist across
+restarts. A task refreshes the permits at logon and when the active network changes.
 .PARAMETER VpnAdapter
-Exact Windows adapter name or GUID. Must be a virtual VPN interface. With no explicit selection,
-the installer offers a list of connected virtual interfaces. No selection means block all external traffic.
+Optional exact adapter name(s) or GUID(s). Explicit choices are saved by GUID.
 .PARAMETER Program
 Additional absolute .exe path(s), e.g. a browser dedicated to ChatGPT.
 The entire executable is protected, including its other profiles and tabs.
 .PARAMETER BlockAll
 Install the policy without any VPN exception. Local loopback still works.
+.PARAMETER Auto
+Use active default routes on Windows tunnel interfaces.
+.PARAMETER NoStartup
+Apply the current rules and remove the background task.
 .PARAMETER Plan
-Show selected adapter or available choices and protected applications without changing WFP or requesting elevation.
+Show the selected tunnels and protected applications without changing WFP,
+registering tasks or requesting elevation.
 .PARAMETER Status
-Show the number of installed WFP filters. Requires an Administrator terminal.
+Show the installed WFP filters and the background task. Requires an Administrator terminal.
 .PARAMETER Remove
-Remove only this script's protection. Requires Administrator permissions.
+Remove this script's protection and its background task. Requires Administrator permissions.
 #>
 [CmdletBinding()]
 param(
-    [string]$VpnAdapter,
+    [string[]]$VpnAdapter,
     [string[]]$Program,
     [switch]$BlockAll,
+    [switch]$Auto,
+    [switch]$NoStartup,
     [switch]$Plan,
     [switch]$Status,
     [switch]$Remove,
+    [Parameter(DontShow = $true)][switch]$Reapply,
     [Parameter(DontShow = $true)][switch]$Guided,
     [Parameter(DontShow = $true)][switch]$ChooseVpn,
     [Parameter(DontShow = $true)][switch]$Packaged,
@@ -35,52 +46,98 @@ $ExecutableNames = @('ChatGPT.exe', 'Codex.exe', 'Codex Web GPT.exe',
     'codex-code-mode-host.exe', 'codex-computer-use-swift.exe',
     'codex-windows-sandbox.exe', 'codex-windows-sandbox-service.exe')
 $PackageFamilies = @('OpenAI.Codex_2p2nqsd0c76g0', 'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0')
+$TaskName = 'VPN_WORK GPT VPN guard'
+$RuntimeRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'VPN_WORK'
+$RuntimeFiles = @('gpt_vpn_guard.ps1', 'gpt_vpn_guard_watch.ps1', 'gpt_vpn_filter.cs')
+$PolicyFileName = 'guard-policy.json'
 $configDirectory = if ($Packaged) { Join-Path $env:LOCALAPPDATA 'VPN_WORK' } else { $PSScriptRoot }
 $ConfigPath = Join-Path $configDirectory 'gpt_vpn_guard.local.json'
 
-function Get-VpnAdapterChoices {
-    param([object[]]$Adapters)
-    $Adapters | Where-Object {
-        $_.HardwareInterface -eq $false -and $_.InterfaceGuid -and $_.Status -eq 'Up' -and
-        $_.InterfaceDescription -notmatch 'ZeroTier|Hyper-V|Loopback|Bluetooth|Wi-Fi Direct' -and
-        $_.InterfaceDescription -notmatch '^WAN Miniport \((IP|IPv6|Network Monitor|PPPOE)\)$'
-    } | Sort-Object Name
+$NonVpnAdapterDescriptions = @(
+    'Hyper-V', 'vEthernet', 'Virtual Switch', 'Loopback', 'Bluetooth', 'Wi-Fi Direct',
+    'Kernel Debug', 'Teredo', '6to4', 'IP-HTTPS', 'Pseudo-Interface', 'RAS Async',
+    'ISATAP', 'Host[- ]Only', 'VMware Network Adapter', '^WAN Miniport \((IP|IPv6|Network Monitor|PPPOE)\)$'
+)
+
+function Get-VpnAdapterExclusion {
+    param([object]$Adapter)
+    if ($Adapter.Name -match 'ZeroTier' -or $Adapter.InterfaceDescription -match 'ZeroTier') { return 'виртуальная локальная сеть ZeroTier' }
+    if ($Adapter.HardwareInterface -eq $true) { return 'физический адаптер' }
+    if (-not $Adapter.InterfaceGuid -or $false -ne $Adapter.HardwareInterface) { return 'тип или GUID интерфейса неизвестен' }
+    foreach ($pattern in $NonVpnAdapterDescriptions) {
+        if ($Adapter.InterfaceDescription -match $pattern -or $Adapter.Name -match $pattern) {
+            return 'служебный интерфейс или виртуальная локальная сеть'
+        }
+    }
 }
 
-function Select-VpnAdapter {
-    param([object[]]$Adapters, [string]$Requested, [switch]$Prompt)
+function Test-VpnPathAdapter {
+    param([object]$Adapter)
+    return -not (Get-VpnAdapterExclusion $Adapter)
+}
 
-    if ($Requested) {
+function Get-VpnPathAdapters {
+    param([object[]]$Adapters)
+    return @($Adapters | Where-Object { Test-VpnPathAdapter -Adapter $_ } | Sort-Object Name)
+}
+
+function Get-AutomaticVpnAdapters {
+    param([object[]]$Adapters, [object[]]$Routes)
+
+    # IANA ifTypes ppp(23), propVirtual(53), tunnel(131). Virtual Ethernet and
+    # overlays still require an explicit choice, even if they advertise a default.
+    $candidates = @(Get-VpnPathAdapters $Adapters | Where-Object {
+        $_.Status -eq 'Up' -and $_.InterfaceType -in @(23, 53, 131)
+    })
+    $indices = @(foreach ($family in @('IPv4', 'IPv6')) {
+        $default = if ($family -eq 'IPv4') { '0.0.0.0/0' } else { '::/0' }
+        $halves = if ($family -eq 'IPv4') { @('0.0.0.0/1', '128.0.0.0/1') } else { @('::/1', '8000::/1') }
+        $used = @(foreach ($half in $halves) {
+            $ordered = @($Routes | Where-Object DestinationPrefix -in @($half, $default) |
+                Sort-Object @{ Expression = { if ($_.DestinationPrefix -eq $half) { 0 } else { 1 } } },
+                    @{ Expression = { [long]$_.RouteMetric + [long]$_.InterfaceMetric } })
+            if (-not $ordered.Count) { continue }
+            $first = $ordered[0]
+            $cost = [long]$first.RouteMetric + [long]$first.InterfaceMetric
+            $best = @($ordered | Where-Object { $_.DestinationPrefix -eq $first.DestinationPrefix -and
+                ([long]$_.RouteMetric + [long]$_.InterfaceMetric) -eq $cost } |
+                Select-Object -ExpandProperty InterfaceIndex -Unique)
+            if ($best.Count -eq 1) { $best[0] }
+        })
+        if ($used.Count -eq 2 -and $used[0] -eq $used[1]) { $used[0] }
+    })
+    return @($candidates | Where-Object InterfaceIndex -in $indices)
+}
+
+function Resolve-ApprovedVpnGuids {
+    param([object[]]$Adapters, [string[]]$Requested, [switch]$Refresh)
+
+    $resolved = @(foreach ($item in @($Requested)) {
+        if ([string]::IsNullOrWhiteSpace($item)) { continue }
         $requestedGuid = [guid]::Empty
-        if ([guid]::TryParse($Requested, [ref]$requestedGuid)) {
+        $isGuid = [guid]::TryParse($item, [ref]$requestedGuid)
+        if ($isGuid) {
             $matches = @($Adapters | Where-Object { $_.InterfaceGuid -and [guid]$_.InterfaceGuid -eq $requestedGuid })
         } else {
-            $matches = @($Adapters | Where-Object Name -eq $Requested)
+            $matches = @($Adapters | Where-Object Name -eq $item)
         }
-        if ($matches.Count -eq 0) { return }
-        if ($matches.Count -ne 1) { throw 'The requested adapter is ambiguous; use its exact GUID.' }
-        if ($matches[0].Status -ne 'Up') { return }
-        if (-not (Get-VpnAdapterChoices -Adapters $matches)) {
-            throw 'Choose a connected virtual VPN adapter; LAN, ZeroTier and host-only adapters are not VPN targets.'
+        if ($matches.Count -eq 0) {
+            Write-Host "VPN interface is not connected: $item"
+            if ($isGuid -and $requestedGuid -ne [guid]::Empty) { $requestedGuid.ToString() }
+            continue
         }
-        return $matches[0]
-    }
-
-    $choices = @(Get-VpnAdapterChoices -Adapters $Adapters)
-    if ($choices.Count -eq 0) { return }
-    Write-Host 'Connected virtual interfaces (choose only the one belonging to your VPN):'
-    for ($index = 0; $index -lt $choices.Count; $index++) {
-        $item = $choices[$index]
-        Write-Host "  $($index + 1). $($item.Name) [$($item.InterfaceDescription)] ($($item.InterfaceGuid))"
-    }
-    if (-not $Prompt) { return }
-    $answer = Read-Host 'VPN interface number (Enter to block all external connections)'
-    if (-not $answer) { return }
-    $number = 0
-    if (-not [int]::TryParse($answer, [ref]$number) -or $number -lt 1 -or $number -gt $choices.Count) {
-        throw 'Invalid adapter number; run setup again or use -BlockAll.'
-    }
-    return $choices[$number - 1]
+        if ($matches.Count -ne 1) { throw "The requested adapter is ambiguous; use its exact GUID: $item" }
+        if (-not (Test-VpnPathAdapter -Adapter $matches[0])) {
+            if ($Refresh) {
+                Write-Host "VPN interface is no longer eligible: $($matches[0].Name)"
+                continue
+            }
+            throw "Choose a virtual VPN adapter. Physical adapters and local virtual networks such as ZeroTier and Hyper-V are excluded: $item"
+        }
+        if ($matches[0].Status -ne 'Up') { Write-Host "VPN interface is not connected: $($matches[0].Name)" }
+        ([guid]$matches[0].InterfaceGuid).ToString()
+    })
+    return @($resolved | Sort-Object -Unique)
 }
 
 function Find-GuardPrograms {
@@ -106,43 +163,213 @@ function Find-GuardPrograms {
     return @($paths | Sort-Object -Unique)
 }
 
-function Select-GuidedVpnAdapter {
-    param([object[]]$Adapters, [string]$Saved, [switch]$Choose, [switch]$PlanOnly)
+function Read-GuardConfig {
+    param([string]$Path)
 
-    if ($Saved -and -not $Choose) {
-        $adapter = Select-VpnAdapter -Adapters $Adapters -Requested $Saved
-        if ($adapter) { return $adapter }
-        Write-Host 'Сохранённый VPN сейчас не подключён.'
-        return
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $config = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw | ConvertFrom-Json
+    $allowedKeys = @('Mode', 'VpnAdapter', 'VpnAdapters', 'Programs')
+    if ($config -isnot [pscustomobject] -or
+        @($config.PSObject.Properties | Where-Object Name -notin $allowedKeys).Count -ne 0) {
+        throw "Invalid config in $Path. Allowed keys: Mode, VpnAdapter, VpnAdapters, Programs."
     }
-    $choices = @(Get-VpnAdapterChoices -Adapters $Adapters)
-    if (-not $choices.Count) { Write-Host 'Подключённый VPN не найден.'; return }
-    Write-Host 'Выберите интерфейс вашего VPN. Если не уверены, нажмите Enter для пропуска.'
-    for ($index = 0; $index -lt $choices.Count; $index++) {
-        Write-Host "  $($index + 1)  $($choices[$index].Name) — $($choices[$index].InterfaceDescription)"
-    }
-    if ($PlanOnly) { return }
-    while ($true) {
-        $answer = Read-Host 'Номер VPN (Enter — пропустить)'
-        if ([string]::IsNullOrWhiteSpace($answer)) { return }
-        $number = 0
-        if ([int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $choices.Count) {
-            return $choices[$number - 1]
+    $mode = 'auto'
+    $modeSpecified = $false
+    if ($null -ne $config.PSObject.Properties['Mode']) {
+        if ($config.Mode -isnot [string] -or $config.Mode -notin @('auto', 'adapters', 'blockall')) {
+            throw "Invalid Mode in $Path. Expected auto, adapters or blockall."
         }
-        Write-Host 'Введите номер из списка.'
+        $mode = $config.Mode
+        $modeSpecified = $true
+    }
+    $adapters = @()
+    if ($null -ne $config.PSObject.Properties['VpnAdapters']) {
+        if ($config.VpnAdapters -isnot [array] -or
+            @($config.VpnAdapters | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count -ne 0) {
+            throw "Invalid VpnAdapters in $Path. Expected an array of adapter names or GUIDs."
+        }
+        $adapters = @($config.VpnAdapters | Where-Object { $_ })
+    } elseif ($null -ne $config.PSObject.Properties['VpnAdapter']) {
+        if ($null -ne $config.VpnAdapter -and $config.VpnAdapter -isnot [string]) {
+            throw "Invalid VpnAdapter in $Path. Expected an adapter name or GUID."
+        }
+        if ($config.VpnAdapter) { $adapters = @($config.VpnAdapter) }
+    }
+    $programs = @()
+    if ($null -ne $config.PSObject.Properties['Programs']) {
+        if ($config.Programs -isnot [array] -or
+            @($config.Programs | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count -ne 0) {
+            throw "Invalid Programs in $Path. Expected an array of paths."
+        }
+        $programs = @($config.Programs | Where-Object { $_ })
+    }
+    return [pscustomobject]@{ Mode = $(if (-not $modeSpecified -and $adapters.Count) { 'adapters' } else { $mode }); Adapters = $adapters; Programs = $programs }
+}
+
+function Assert-GuardRuntimeItem {
+    param([string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Guard runtime is a reparse point: $Path" }
+    $acl = Get-Acl -LiteralPath $Path
+    $sidType = [Security.Principal.SecurityIdentifier]
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($acl.GetOwner($sidType).Value -notin $trusted) { throw "Guard runtime has an untrusted owner: $Path" }
+    # GenericWrite/GenericAll may also be present as generic NTFS rights.
+    $writeRights = [Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    $writeMask = [int]$writeRights -bor 0x50000000
+    foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+        if ($rule.AccessControlType -eq 'Allow' -and
+            -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            ([int]$rule.FileSystemRights -band $writeMask) -and $rule.IdentityReference.Value -notin $trusted) {
+            throw "Guard runtime can be changed without administrator permissions: $Path"
+        }
     }
 }
 
-function Save-GuidedVpnAdapter {
-    param([string]$Path, [guid]$Adapter, [string[]]$Programs)
-    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
-    $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+function Test-GuardRuntimePath {
+    param([string]$Path)
+    if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { return $false }
+    $normalized = [IO.Path]::GetFullPath($Path)
+    return [IO.Path]::GetDirectoryName($normalized) -eq $RuntimeRoot -and
+        [IO.Path]::GetFileName($normalized) -match '^guard-[a-f0-9]{64}$'
+}
+
+function Read-ApprovedGuardPolicy {
+    param([string]$Runtime)
+    if (-not (Test-GuardRuntimePath $Runtime)) { throw 'The background task requires an approved runtime in Program Files.' }
+    Assert-GuardRuntimeItem $RuntimeRoot
+    Assert-GuardRuntimeItem $Runtime
+    foreach ($name in $RuntimeFiles + $PolicyFileName) { Assert-GuardRuntimeItem (Join-Path $Runtime $name) }
+    return Read-GuardConfig (Join-Path $Runtime $PolicyFileName)
+}
+
+function Publish-GuardRuntime {
+    param([string]$Mode, [string[]]$Adapters, [string[]]$Programs)
+
+    $files = [ordered]@{}
+    foreach ($name in $RuntimeFiles) { $files[$name] = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name)) }
+    $json = [ordered]@{ Mode = $Mode; VpnAdapters = @($Adapters | Where-Object { $_ }); Programs = @($Programs | Where-Object { $_ }) } |
+        ConvertTo-Json -Compress
+    $files[$PolicyFileName] = [Text.Encoding]::UTF8.GetBytes($json)
+    $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        [ordered]@{ VpnAdapter = $Adapter.ToString(); Programs = @($Programs | Where-Object { $_ }) } |
-            ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        $hashes = [ordered]@{}
+        foreach ($name in $files.Keys) { $hashes[$name] = [BitConverter]::ToString($sha.ComputeHash([byte[]]$files[$name])).Replace('-', '') }
+        $key = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes(($hashes.Values -join '')))).Replace('-', '').ToLowerInvariant()
+        [void][IO.Directory]::CreateDirectory($RuntimeRoot)
+        Assert-GuardRuntimeItem $RuntimeRoot
+        $runtime = Join-Path $RuntimeRoot "guard-$key"
+        [void][IO.Directory]::CreateDirectory($runtime)
+        Assert-GuardRuntimeItem $runtime
+        foreach ($name in $files.Keys) {
+            $path = Join-Path $runtime $name
+            if (-not (Test-Path -LiteralPath $path)) {
+                $temporary = Join-Path $runtime ([guid]::NewGuid().ToString('N') + '.tmp')
+                try {
+                    [IO.File]::WriteAllBytes($temporary, [byte[]]$files[$name])
+                    [IO.File]::Move($temporary, $path)
+                } finally {
+                    if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+                }
+            }
+            Assert-GuardRuntimeItem $path
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $hashes[$name]) {
+                throw "Guard runtime file does not match the approved copy: $path"
+            }
+        }
+        return $runtime
+    } finally { $sha.Dispose() }
+}
+
+function Open-GuardSetupLock {
+    [void][IO.Directory]::CreateDirectory($RuntimeRoot)
+    Assert-GuardRuntimeItem $RuntimeRoot
+    $path = Join-Path $RuntimeRoot 'guard-setup.lock'
+    if (Test-Path -LiteralPath $path) { Assert-GuardRuntimeItem $path }
+    try { return [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch [IO.IOException] { throw "Could not lock GPT VPN setup: $($_.Exception.Message)" }
+}
+
+function Get-GuardStartup {
+    return Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+}
+
+function Register-GuardStartup {
+    param([string]$Runtime)
+    $watch = Join-Path $Runtime 'gpt_vpn_guard_watch.ps1'
+    $arguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`""
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -WorkingDirectory $Runtime
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $action -Trigger $trigger -Principal $principal `
+        -Settings $settings -Description 'Re-applies the VPN-only policy for ChatGPT and Codex at logon and on network changes.' -Force | Out-Null
+}
+
+function Stop-GuardStartup {
+    $task = Get-GuardStartup
+    if (-not $task) { return }
+    Disable-ScheduledTask -InputObject $task | Out-Null
+    Stop-ScheduledTask -InputObject $task
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        if ((Get-GuardStartup).State -ne 'Running') { return }
+        Start-Sleep -Milliseconds 500
+    }
+    throw 'The previous guard task is still running.'
+}
+
+function Write-GuardAdapterList {
+    param([object[]]$Adapters, [object[]]$Permitted)
+    $permittedIds = @($Permitted | ForEach-Object { $_.InterfaceGuid })
+    Write-Host 'Сетевые адаптеры Windows'
+    for ($index = 0; $index -lt $Adapters.Count; $index++) {
+        $adapter = $Adapters[$index]
+        $reason = Get-VpnAdapterExclusion $adapter
+        if ($reason) { $note = "выбор запрещён ($reason)" }
+        elseif ($adapter.Status -ne 'Up') { $note = 'сейчас не подключён' }
+        elseif ($adapter.InterfaceGuid -in $permittedIds) { $note = 'выбран для VPN' }
+        else { $note = 'доступен для ручного выбора' }
+        Write-Host ("  {0}  {1} [{2}] — {3} | ifIndex {4} | GUID {5} | {6}" -f ($index + 1),
+            $adapter.Name, $adapter.InterfaceDescription, $adapter.Status, $adapter.InterfaceIndex, $adapter.InterfaceGuid, $note)
+    }
+}
+
+function Select-GuidedVpnAdapters {
+    param([object[]]$Adapters)
+
+    $choices = @($Adapters | Sort-Object Name)
+    Write-GuardAdapterList -Adapters $choices
+    if (-not @(Get-VpnPathAdapters -Adapters $choices | Where-Object Status -eq 'Up').Count) {
+        Write-Host 'Подключённый VPN не найден. Автоматический режим проверит маршруты, когда VPN появится.'
+        return @()
+    }
+    while ($true) {
+        $answer = Read-Host 'Номера VPN через запятую (Enter — автоматический выбор по маршрутам)'
+        if ([string]::IsNullOrWhiteSpace($answer)) { return @() }
+        $picked = @()
+        $valid = $true
+        foreach ($token in ($answer -split ',')) {
+            $number = 0
+            if (-not [int]::TryParse($token.Trim(), [ref]$number) -or $number -lt 1 -or $number -gt $choices.Count) {
+                $valid = $false
+                break
+            }
+            $adapter = $choices[$number - 1]
+            $reason = Get-VpnAdapterExclusion $adapter
+            if ($reason -or $adapter.Status -ne 'Up') {
+                if (-not $reason) { $reason = 'интерфейс сейчас не подключён' }
+                Write-Host "Адаптер $($adapter.Name) недоступен для выбора ($reason)."
+                $valid = $false
+                break
+            }
+            $picked += $adapter
+        }
+        if ($valid) { return @($picked | Sort-Object Name -Unique) }
+        Write-Host 'Введите номера адаптеров, доступных для выбора.'
     }
 }
 
@@ -151,15 +378,18 @@ if ($Help) {
     exit 0
 }
 
+$setupLock = $null
 try {
-    if (($Status -or $Remove) -and ($Plan -or $BlockAll -or $Guided -or $VpnAdapter -or $Program -or ($Status -and $Remove))) {
-        throw 'Use -Status or -Remove on its own.'
+    $selection = $BlockAll -or $Guided -or $Auto -or $VpnAdapter -or $Program -or $ChooseVpn -or $NoStartup
+    if ((($Status -or $Remove -or $Reapply) -and ($Plan -or $selection)) -or
+        @(@($Status, $Remove, $Reapply) | Where-Object { $_ }).Count -gt 1) {
+        throw 'Use -Status, -Remove or -Reapply on its own.'
     }
     if (($ChooseVpn -and -not $Guided) -or ($Guided -and $BlockAll)) { throw 'Incompatible VPN selection modes.' }
 
     $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $Plan -and -not $admin) {
+    if (-not $Plan -and -not $Reapply -and -not $admin) {
         if ($PSBoundParameters.ContainsKey('Program') -or $VpnAdapter) {
             throw 'Open PowerShell as Administrator when passing -VpnAdapter or -Program, or set them in gpt_vpn_guard.local.json.'
         }
@@ -170,67 +400,118 @@ try {
         if ($Remove) { $argsForAdmin += ' -Remove' }
         if ($Status) { $argsForAdmin += ' -Status' }
         if ($BlockAll) { $argsForAdmin += ' -BlockAll' }
+        if ($Auto) { $argsForAdmin += ' -Auto' }
+        if ($NoStartup) { $argsForAdmin += ' -NoStartup' }
         $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -ArgumentList $argsForAdmin -Verb RunAs -PassThru -Wait
         exit $process.ExitCode
     }
+    if ($Reapply -and -not $admin) { throw 'The background task must run with Administrator permissions.' }
 
-    if (-not $Status -and -not $Remove) {
-        if (Test-Path -LiteralPath $ConfigPath) {
-            $config = Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -Raw | ConvertFrom-Json
-            if ($config -isnot [pscustomobject] -or
-                @($config.PSObject.Properties | Where-Object Name -notin @('VpnAdapter', 'Programs')).Count -ne 0 -or
-                ($null -ne $config.VpnAdapter -and $config.VpnAdapter -isnot [string]) -or
-                ($null -ne $config.Programs -and $config.Programs -isnot [array]) -or
-                @($config.Programs | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count -ne 0) {
-                throw "Invalid config in $ConfigPath. Expected VpnAdapter (string) and Programs (array of paths)."
+    $oldTask = if (-not $Reapply) { Get-GuardStartup }
+    $oldRuntime = if ($oldTask) { [string]$oldTask.Actions[0].WorkingDirectory }
+    if ($Status -or $Remove) {
+        if (-not ('GptVpnFilter' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs') }
+        if ($Remove) {
+            $setupLock = Open-GuardSetupLock
+            $oldTask = Get-GuardStartup
+            if ($oldTask) {
+                Stop-GuardStartup
+                Unregister-ScheduledTask -InputObject $oldTask -Confirm:$false | Out-Null
             }
-            if (-not $PSBoundParameters.ContainsKey('VpnAdapter')) { $VpnAdapter = $config.VpnAdapter }
-            if (-not $PSBoundParameters.ContainsKey('Program') -and $null -ne $config.Programs) { $Program = @($config.Programs) }
+            Write-Host "Removed GPT VPN filters: $([GptVpnFilter]::Remove())"
+            exit 0
         }
-        $extra = @(Find-GuardPrograms -ExtraPrograms $Program -UserProfile $env:USERPROFILE)
-        $adapter = $null
-        if ($Guided) {
-            $adapter = Select-GuidedVpnAdapter -Adapters @(Get-NetAdapter -IncludeHidden) -Saved $VpnAdapter -Choose:$ChooseVpn -PlanOnly:$Plan
-            if (-not $adapter) { Write-Host 'Защита ChatGPT и Codex не изменена.'; exit 3 }
-        } elseif (-not $BlockAll) {
-            $adapter = Select-VpnAdapter -Adapters @(Get-NetAdapter -IncludeHidden) -Requested $VpnAdapter -Prompt:(-not $Plan)
-        }
-        $adapterGuid = [guid]::Empty
-        if ($adapter) {
-            $adapterGuid = [guid]$adapter.InterfaceGuid
-            Write-Host "VPN interface: $($adapter.Name) ($adapterGuid)"
-        } else {
-            Write-Host 'No VPN exception: all external connections from the protected applications will be blocked.'
-        }
-        Write-Host "Executable names: $($ExecutableNames -join ', ')"
-        Write-Host "OpenAI packages: $($PackageFamilies -join ', ')"
-        foreach ($path in $extra) { Write-Host "Additional executable: $path" }
-        if ($Plan) { exit 0 }
+
+        $count = [GptVpnFilter]::Count()
+        Write-Host "Installed GPT VPN filters: $count"
+        if ($oldTask) {
+            Write-Host "Задача: $TaskName ($($oldTask.State))"
+            if (Test-GuardRuntimePath $oldRuntime) {
+                $approved = Read-ApprovedGuardPolicy $oldRuntime
+                Write-Host "Mode: $($approved.Mode)"
+                Write-Host "Журнал: $(Join-Path $oldRuntime 'guard-watch.log')"
+            } else { Write-Warning 'Задача использует старую папку. Повторно включите защиту из текущей версии.' }
+        } else { Write-Host 'Автоприменение при входе выключено.' }
+        Write-GuardAdapterList -Adapters @(Get-NetAdapter -IncludeHidden | Sort-Object Name)
+        exit 0
     }
 
-    Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs')
-    if ($Status) {
-        $count = [GptVpnFilter]::Count()
-        if ($Packaged) {
-            if ($count -eq 0) { Write-Host 'Защита ChatGPT и Codex не установлена.' }
-            else { Write-Host "Установлены правила защиты: $count. Это не проверка доступности VPN." }
-        } else {
-            Write-Host "Installed GPT VPN filters: $count"
-            if ($count -eq 0) { exit 1 }
+    $config = if ($Reapply) { Read-ApprovedGuardPolicy $PSScriptRoot } else {
+        $draft = Read-GuardConfig -Path $ConfigPath
+        if ($draft) { $draft } elseif (Test-GuardRuntimePath $oldRuntime) { Read-ApprovedGuardPolicy $oldRuntime }
+    }
+    $mode = if ($config) { $config.Mode } else { 'auto' }
+    $savedAdapters = if ($config) { @($config.Adapters) } else { @() }
+    $savedPrograms = if ($config) { @($config.Programs) } else { @() }
+
+    if ($BlockAll) { $mode = 'blockall'; $savedAdapters = @() }
+    elseif ($VpnAdapter) { $mode = 'adapters'; $savedAdapters = @($VpnAdapter) }
+    elseif ($Auto) { $mode = 'auto'; $savedAdapters = @() }
+
+    if (-not $PSBoundParameters.ContainsKey('Program') -and $savedPrograms.Count) { $Program = @($savedPrograms) }
+
+    $allAdapters = @()
+    if ($Plan -or $mode -ne 'blockall' -or ($Guided -and $ChooseVpn)) { $allAdapters = @(Get-NetAdapter -IncludeHidden) }
+    if ($Guided -and $ChooseVpn -and -not $Plan) {
+        $picked = @(Select-GuidedVpnAdapters -Adapters $allAdapters)
+        if ($picked.Count) { $mode = 'adapters'; $savedAdapters = @($picked | ForEach-Object { $_.InterfaceGuid.ToString() }) }
+        else { $mode = 'auto'; $savedAdapters = @() }
+    }
+
+    $approvedGuids = @()
+    $adapters = @(switch ($mode) {
+        'blockall' { }
+        'adapters' {
+            $approvedGuids = @(Resolve-ApprovedVpnGuids -Adapters $allAdapters -Requested $savedAdapters -Refresh:$Reapply)
+            Get-VpnPathAdapters -Adapters $allAdapters | Where-Object {
+                $_.Status -eq 'Up' -and ([guid]$_.InterfaceGuid).ToString() -in $approvedGuids
+            }
         }
-    } elseif ($Remove) {
-        Write-Host "Removed GPT VPN filters: $([GptVpnFilter]::Remove())"
+        default { Get-AutomaticVpnAdapters -Adapters $allAdapters -Routes @(Get-NetRoute -PolicyStore ActiveStore) }
+    })
+    $extra = @(Find-GuardPrograms -ExtraPrograms $Program -UserProfile $env:USERPROFILE)
+    if ($adapters.Count) {
+        foreach ($adapter in $adapters) { Write-Host "VPN interface: $($adapter.Name) ($($adapter.InterfaceGuid))" }
     } else {
-        $count = [GptVpnFilter]::Apply($adapterGuid, $ExecutableNames, $extra, $PackageFamilies)
+        Write-Host 'No VPN exception: all external connections from the protected applications will be blocked.'
+    }
+    Write-Host "Mode: $mode"
+    Write-Host "Executable names: $($ExecutableNames -join ', ')"
+    Write-Host "OpenAI packages: $($PackageFamilies -join ', ')"
+    foreach ($path in $extra) { Write-Host "Additional executable: $path" }
+    if ($Plan -or (-not $Reapply -and -not $ChooseVpn -and $allAdapters.Count)) {
+        Write-GuardAdapterList -Adapters @($allAdapters | Sort-Object Name) -Permitted $adapters
+    }
+    if ($Plan) { exit 0 }
+
+    if (-not ('GptVpnFilter' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'gpt_vpn_filter.cs') }
+    if (-not $Reapply) {
+        $setupLock = Open-GuardSetupLock
+        $oldTask = Get-GuardStartup
+        if (-not $NoStartup) {
+            $runtime = Publish-GuardRuntime -Mode $mode -Adapters $approvedGuids -Programs @($Program)
+        }
+        Stop-GuardStartup
+        if ($NoStartup) {
+            if ($oldTask) { Unregister-ScheduledTask -InputObject $oldTask -Confirm:$false | Out-Null }
+        } else { Register-GuardStartup -Runtime $runtime }
+    }
+
+    $guids = @($adapters | ForEach-Object { [guid]$_.InterfaceGuid })
+    try {
+        $count = [GptVpnFilter]::Apply([guid[]]$guids, $ExecutableNames, $extra, $PackageFamilies)
         Write-Host "Installed GPT VPN filters: $count (blocking rules persist after restart)."
-        if ($Guided -and $VpnAdapter -ne $adapterGuid.ToString()) {
-            try { Save-GuidedVpnAdapter -Path $ConfigPath -Adapter $adapterGuid -Programs $Program }
-            catch { Write-Warning "Защита включена, но сохранить выбор VPN не удалось: $($_.Exception.Message)" }
+    } finally {
+        if (-not $Reapply -and -not $NoStartup) {
+            Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
         }
     }
+    if (-not $Reapply -and -not $NoStartup) { Write-Host "Автоприменение при входе включено. Журнал: $(Join-Path $runtime 'guard-watch.log')" }
     exit 0
 } catch {
     Write-Host "ERROR: $($_.Exception.Message)"
     exit 1
+} finally {
+    if ($null -ne $setupLock) { $setupLock.Dispose() }
 }
