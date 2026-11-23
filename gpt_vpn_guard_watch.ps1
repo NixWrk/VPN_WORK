@@ -32,12 +32,21 @@ function Get-NetworkSignature {
         '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $_.ifIndex, $_.Name, $_.Status, $_.InterfaceGuid,
             $_.HardwareInterface, $_.InterfaceDescription, $_.InterfaceType
     })
+    # Only the winning interfaces matter. Raw metrics of a physical adapter can
+    # flap without changing the VPN choice, and applying WFP filters every few
+    # seconds is expensive.
     $prefixes = @('0.0.0.0/0', '0.0.0.0/1', '128.0.0.0/1', '::/0', '::/1', '8000::/1')
-    $routes = @(Get-NetRoute -PolicyStore ActiveStore | Where-Object DestinationPrefix -in $prefixes | ForEach-Object {
-        '{0}|{1}|{2}|{3}' -f $_.InterfaceIndex, $_.DestinationPrefix, $_.RouteMetric, $_.InterfaceMetric
-    } | Sort-Object)
-    $bfe = Get-CimInstance Win32_Service -Filter "Name='BFE'"
-    return (($parts + $routes) -join "`n") + "|bfe=$($bfe.ProcessId):$($bfe.State)"
+    $routes = @(Get-NetRoute -PolicyStore ActiveStore | Where-Object DestinationPrefix -in $prefixes)
+    $selected = @(foreach ($prefix in $prefixes) {
+        $matching = @($routes | Where-Object DestinationPrefix -eq $prefix)
+        if (-not $matching.Count) { continue }
+        $cost = ($matching | ForEach-Object { [long]$_.RouteMetric + [long]$_.InterfaceMetric } |
+            Measure-Object -Minimum).Minimum
+        $owners = @($matching | Where-Object { [long]$_.RouteMetric + [long]$_.InterfaceMetric -eq $cost } |
+            Select-Object -ExpandProperty InterfaceIndex -Unique | Sort-Object)
+        '{0}|{1}' -f $prefix, ($owners -join ',')
+    })
+    return ($parts + $selected) -join "`n"
 }
 
 function Invoke-GuardApply {

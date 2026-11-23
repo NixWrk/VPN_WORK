@@ -38,6 +38,24 @@ function Get-NetRoute {
         }
         return
     }
+    if ($Scenario -eq 'SplitTunnel') {
+        # WireGuard-style exclusion list: specific public routes in both halves.
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='45.140.176.0/22'; RouteMetric=500; InterfaceMetric=5}
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='185.220.100.0/22'; RouteMetric=500; InterfaceMetric=5}
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='10.68.191.0/24'; RouteMetric=500; InterfaceMetric=5}
+        return
+    }
+    if ($Scenario -eq 'PrivateTunnel') {
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='10.68.191.0/24'; RouteMetric=500; InterfaceMetric=5}
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='192.168.50.0/24'; RouteMetric=500; InterfaceMetric=5}
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='169.254.10.0/24'; RouteMetric=500; InterfaceMetric=5}
+        return
+    }
+    if ($Scenario -eq 'HalfPublic') {
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='45.140.176.0/22'; RouteMetric=500; InterfaceMetric=5}
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='192.168.50.0/24'; RouteMetric=500; InterfaceMetric=5}
+        return
+    }
     foreach ($prefix in '0.0.0.0/1','128.0.0.0/1') {
         [pscustomobject]@{InterfaceIndex=3; DestinationPrefix=$prefix; RouteMetric=500; InterfaceMetric=5}
     }
@@ -109,7 +127,12 @@ exit $LASTEXITCODE
         }
     }
 
-    foreach ($scenario in @('OverlayWins', 'OnlyHalf', 'Ambiguous')) {
+    $split = Invoke-Scenario 'SplitTunnel'
+    if ($split.Code -ne 0 -or $split.Output -notmatch 'VPN interface: Other VPN' -or
+        $split.Output -match 'VPN interface: (Wi-Fi|WSL|ZeroTier|Office tunnel)') {
+        throw "Split-tunnel routes were not detected: $($split.Output)"
+    }
+    foreach ($scenario in @('OverlayWins', 'OnlyHalf', 'Ambiguous', 'PrivateTunnel', 'HalfPublic')) {
         $result = Invoke-Scenario $scenario
         if ($result.Code -ne 0 -or $result.Output -notmatch 'No VPN exception' -or $result.Output -match 'VPN interface:') {
             throw "Unsafe route accepted in $scenario ($($result.Output))"
@@ -213,7 +236,7 @@ exit $LASTEXITCODE
     $script:taskOwner = 'S-1-0-0'
     if (Read-GuardPolicyForMigration $scheduled) { throw 'Another user task was accepted.' }
 
-    Write-Host 'PASS: VPN route selection, fail-closed planning, and migration preserving approved policy and task ownership'
+    Write-Host 'PASS: VPN default, split-default and split-tunnel route selection, fail-closed planning, and migration preserving approved policy and task ownership'
 } finally {
     if (Test-Path -LiteralPath $absolute) { Remove-Item -LiteralPath $absolute -Recurse -Force }
 }

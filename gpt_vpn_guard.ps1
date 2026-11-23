@@ -2,9 +2,10 @@
 .SYNOPSIS
 Protects ChatGPT, Codex and explicitly selected Windows executables with a VPN-only network policy.
 .DESCRIPTION
-The automatic mode uses Windows tunnel adapter types and active default or split-default
-routes. Select other trusted VPN interfaces explicitly. Blocking rules persist across
-restarts. A task refreshes the permits at logon and when the active network changes.
+The automatic mode uses Windows tunnel adapter types and active default, split-default
+or split-tunnel public routes. Select other trusted VPN interfaces explicitly. Blocking
+rules persist across restarts. A task refreshes the permits at logon and when the active
+network changes.
 .PARAMETER VpnAdapter
 Optional exact adapter name(s) or GUID(s). Explicit choices are saved by GUID.
 .PARAMETER Program
@@ -84,6 +85,35 @@ function Get-VpnPathAdapters {
     return @($Adapters | Where-Object { Test-VpnPathAdapter -Adapter $_ } | Sort-Object Name)
 }
 
+function Test-PublicRoutePrefix {
+    param([string]$Prefix)
+    if ($Prefix -notmatch '^([^/]+)/(\d{1,3})$') { return $false }
+    $address = $null
+    if (-not [Net.IPAddress]::TryParse($matches[1], [ref]$address)) { return $false }
+    $length = [int]$matches[2]
+    $bytes = $address.GetAddressBytes()
+    if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+        # Exclude default and half routes: they are handled by the default-route
+        # check. Only specific public prefixes indicate a split tunnel.
+        if ($length -lt 2 -or $length -gt 32) { return $false }
+        if ($bytes[0] -eq 0 -or $bytes[0] -eq 10 -or $bytes[0] -eq 127 -or $bytes[0] -ge 224) { return $false }
+        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $false }
+        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $false }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $false }
+        if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) { return $false }
+        return $true
+    }
+    if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+        if ($length -lt 2 -or $length -gt 128) { return $false }
+        if ($address.Equals([Net.IPAddress]::IPv6Loopback)) { return $false }
+        if (($bytes[0] -band 0xFE) -eq 0xFC) { return $false }
+        if ($bytes[0] -eq 0xFE -and ($bytes[1] -band 0xC0) -eq 0x80) { return $false }
+        if ($bytes[0] -eq 0xFF) { return $false }
+        return $true
+    }
+    return $false
+}
+
 function Get-AutomaticVpnAdapters {
     param([object[]]$Adapters, [object[]]$Routes)
 
@@ -109,7 +139,28 @@ function Get-AutomaticVpnAdapters {
         })
         if ($used.Count -eq 2 -and $used[0] -eq $used[1]) { $used[0] }
     })
-    return @($candidates | Where-Object InterfaceIndex -in $indices)
+    # A split-tunnel VPN may publish an exclusion list with thousands of specific
+    # routes instead of a default. Accept it only when its public routes reach
+    # both halves of a family; one half or a private-only tunnel stays fail-closed.
+    $candidateIndices = @($candidates | ForEach-Object { [int]$_.InterfaceIndex } | Sort-Object -Unique)
+    $publicHalves = @{}
+    foreach ($route in @($Routes | Where-Object { [int]$_.InterfaceIndex -in $candidateIndices })) {
+        $prefix = [string]$route.DestinationPrefix
+        if (-not (Test-PublicRoutePrefix $prefix)) { continue }
+        $address = [Net.IPAddress]::Parse($prefix.Split('/')[0])
+        if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+            $half = if ($address.GetAddressBytes()[0] -lt 128) { 'IPv4 lower' } else { 'IPv4 upper' }
+        } else {
+            $half = if ($address.GetAddressBytes()[0] -lt 0x80) { 'IPv6 lower' } else { 'IPv6 upper' }
+        }
+        $publicHalves["$($route.InterfaceIndex)|$half"] = $true
+    }
+    $split = @(foreach ($index in $candidateIndices) {
+        if (($publicHalves.ContainsKey("$index|IPv4 lower") -and $publicHalves.ContainsKey("$index|IPv4 upper")) -or
+            ($publicHalves.ContainsKey("$index|IPv6 lower") -and $publicHalves.ContainsKey("$index|IPv6 upper"))) { $index }
+    })
+    $accepted = @(@($indices) + @($split) | Sort-Object -Unique)
+    return @($candidates | Where-Object InterfaceIndex -in $accepted)
 }
 
 function Resolve-ApprovedVpnGuids {
@@ -361,6 +412,29 @@ function Stop-GuardStartup {
     throw 'The previous guard task is still running.'
 }
 
+function Stop-ForeignGuardWatchers {
+    param([string[]]$Keep)
+
+    # A replaced task can leave a watcher from an older runtime running under the
+    # Task Scheduler service. That watcher would keep re-applying the old policy,
+    # so stop every watcher except the runtime being registered now.
+    $pattern = [regex]::Escape($RuntimeRoot) + '\\guard-[a-f0-9]{64}'
+    $kept = @($Keep | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_) })
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
+        $commandLine = [string]$process.CommandLine
+        if ($commandLine -notmatch ($pattern + '\\gpt_vpn_guard_watch\.ps1')) { continue }
+        if ($kept -contains [regex]::Match($commandLine, $pattern).Value) { continue }
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            Write-Host "Stopped an outdated guard watcher: $($process.ProcessId)"
+        } catch {
+            if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) {
+                throw "An outdated guard watcher is still running ($($process.ProcessId)). Stop it manually or restart Windows, then enable the guard again. $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 function Write-GuardAdapterList {
     param([object[]]$Adapters, [object[]]$Permitted)
     $permittedIds = @($Permitted | ForEach-Object { $_.InterfaceGuid })
@@ -543,6 +617,9 @@ try {
             $runtime = Publish-GuardRuntime -Mode $mode -Adapters $approvedGuids -Programs @($Program)
         }
         Stop-GuardStartup
+        $keepWatchers = @($PSScriptRoot)
+        if (-not $NoStartup) { $keepWatchers += $runtime }
+        Stop-ForeignGuardWatchers -Keep $keepWatchers
         if ($NoStartup) {
             if (-not (Test-Path -LiteralPath $ManualOnlyPath)) {
                 New-Item -Path $ManualOnlyPath -ItemType File | Out-Null
