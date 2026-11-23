@@ -38,11 +38,18 @@ function Get-NetRoute {
         }
         return
     }
-    if ($Scenario -eq 'SplitTunnel') {
+    if ($Scenario -in @('SplitTunnel', 'FakeIp')) {
         # WireGuard-style exclusion list: specific public routes in both halves.
         [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='45.140.176.0/22'; RouteMetric=500; InterfaceMetric=5}
-        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='185.220.100.0/22'; RouteMetric=500; InterfaceMetric=5}
+        $upper = if ($Scenario -eq 'FakeIp') { '198.18.0.0/15' } else { '185.220.100.0/22' }
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix=$upper; RouteMetric=500; InterfaceMetric=5}
         [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='10.68.191.0/24'; RouteMetric=500; InterfaceMetric=5}
+        return
+    }
+    if ($Scenario -in @('SplitTunnelV6', 'ReservedV6')) {
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix='2606:4700::/32'; RouteMetric=500; InterfaceMetric=5}
+        $other = if ($Scenario -eq 'ReservedV6') { '9000::/64' } else { '2a00:1450::/32' }
+        [pscustomobject]@{InterfaceIndex=3; DestinationPrefix=$other; RouteMetric=500; InterfaceMetric=5}
         return
     }
     if ($Scenario -eq 'PrivateTunnel') {
@@ -127,12 +134,14 @@ exit $LASTEXITCODE
         }
     }
 
-    $split = Invoke-Scenario 'SplitTunnel'
-    if ($split.Code -ne 0 -or $split.Output -notmatch 'VPN interface: Other VPN' -or
-        $split.Output -match 'VPN interface: (Wi-Fi|WSL|ZeroTier|Office tunnel)') {
-        throw "Split-tunnel routes were not detected: $($split.Output)"
+    foreach ($scenario in @('SplitTunnel', 'SplitTunnelV6')) {
+        $split = Invoke-Scenario $scenario
+        if ($split.Code -ne 0 -or $split.Output -notmatch 'VPN interface: Other VPN' -or
+            $split.Output -match 'VPN interface: (Wi-Fi|WSL|ZeroTier|Office tunnel)') {
+            throw "Split-tunnel routes were not detected in $scenario ($($split.Output))"
+        }
     }
-    foreach ($scenario in @('OverlayWins', 'OnlyHalf', 'Ambiguous', 'PrivateTunnel', 'HalfPublic')) {
+    foreach ($scenario in @('OverlayWins', 'OnlyHalf', 'Ambiguous', 'PrivateTunnel', 'HalfPublic', 'FakeIp', 'ReservedV6')) {
         $result = Invoke-Scenario $scenario
         if ($result.Code -ne 0 -or $result.Output -notmatch 'No VPN exception' -or $result.Output -match 'VPN interface:') {
             throw "Unsafe route accepted in $scenario ($($result.Output))"

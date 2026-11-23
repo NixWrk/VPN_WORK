@@ -28,7 +28,8 @@ function Write-WatchLog {
 }
 
 function Get-NetworkSignature {
-    $parts = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Sort-Object ifIndex | ForEach-Object {
+    $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Sort-Object ifIndex)
+    $parts = @($adapters | ForEach-Object {
         '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $_.ifIndex, $_.Name, $_.Status, $_.InterfaceGuid,
             $_.HardwareInterface, $_.InterfaceDescription, $_.InterfaceType
     })
@@ -36,9 +37,10 @@ function Get-NetworkSignature {
     # flap without changing the VPN choice, and applying WFP filters every few
     # seconds is expensive.
     $prefixes = @('0.0.0.0/0', '0.0.0.0/1', '128.0.0.0/1', '::/0', '::/1', '8000::/1')
-    $routes = @(Get-NetRoute -PolicyStore ActiveStore | Where-Object DestinationPrefix -in $prefixes)
+    $routes = @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
+    $defaultRoutes = @($routes | Where-Object DestinationPrefix -in $prefixes)
     $selected = @(foreach ($prefix in $prefixes) {
-        $matching = @($routes | Where-Object DestinationPrefix -eq $prefix)
+        $matching = @($defaultRoutes | Where-Object DestinationPrefix -eq $prefix)
         if (-not $matching.Count) { continue }
         $cost = ($matching | ForEach-Object { [long]$_.RouteMetric + [long]$_.InterfaceMetric } |
             Measure-Object -Minimum).Minimum
@@ -46,7 +48,15 @@ function Get-NetworkSignature {
             Select-Object -ExpandProperty InterfaceIndex -Unique | Sort-Object)
         '{0}|{1}' -f $prefix, ($owners -join ',')
     })
-    return ($parts + $selected) -join "`n"
+    # Split routes may arrive after the adapter is already Up. Route identity
+    # matters here, not metric changes or changes on physical interfaces.
+    $tunnelIndices = @($adapters | Where-Object {
+        $_.Status -eq 'Up' -and $_.HardwareInterface -eq $false -and $_.InterfaceType -in @(23, 53, 131)
+    } | ForEach-Object { $_.ifIndex })
+    $splitRoutes = @($routes | Where-Object {
+        $_.InterfaceIndex -in $tunnelIndices -and $_.DestinationPrefix -notin $prefixes
+    } | ForEach-Object { '{0}|{1}' -f $_.InterfaceIndex, $_.DestinationPrefix } | Sort-Object -Unique)
+    return ($parts + $selected + $splitRoutes) -join "`n"
 }
 
 function Invoke-GuardApply {

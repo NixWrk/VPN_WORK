@@ -14,7 +14,7 @@ The entire executable is protected, including its other profiles and tabs.
 .PARAMETER BlockAll
 Install the policy without any VPN exception. Local loopback still works.
 .PARAMETER Auto
-Use active default routes on Windows tunnel interfaces.
+Use active default, split-default or public split-tunnel routes on Windows tunnel interfaces.
 .PARAMETER NoStartup
 Apply the current rules and remove the background task.
 .PARAMETER Plan
@@ -85,33 +85,37 @@ function Get-VpnPathAdapters {
     return @($Adapters | Where-Object { Test-VpnPathAdapter -Adapter $_ } | Sort-Object Name)
 }
 
-function Test-PublicRoutePrefix {
+function Get-PublicRouteGroup {
     param([string]$Prefix)
-    if ($Prefix -notmatch '^([^/]+)/(\d{1,3})$') { return $false }
+    if ($Prefix -notmatch '^([^/]+)/(\d{1,3})$') { return }
     $address = $null
-    if (-not [Net.IPAddress]::TryParse($matches[1], [ref]$address)) { return $false }
+    if (-not [Net.IPAddress]::TryParse($matches[1], [ref]$address)) { return }
     $length = [int]$matches[2]
     $bytes = $address.GetAddressBytes()
     if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
         # Exclude default and half routes: they are handled by the default-route
         # check. Only specific public prefixes indicate a split tunnel.
-        if ($length -lt 2 -or $length -gt 32) { return $false }
-        if ($bytes[0] -eq 0 -or $bytes[0] -eq 10 -or $bytes[0] -eq 127 -or $bytes[0] -ge 224) { return $false }
-        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $false }
-        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $false }
-        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $false }
-        if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) { return $false }
-        return $true
+        if ($length -lt 2 -or $length -gt 32) { return }
+        if ($bytes[0] -in @(0, 10, 127) -or $bytes[0] -ge 224) { return }
+        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return }
+        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return }
+        if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) { return }
+        if ($bytes[0] -eq 198 -and $bytes[1] -in @(18, 19)) { return }
+        if ($bytes[0] -lt 128) { return 'IPv4 lower' }
+        return 'IPv4 upper'
     }
     if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
-        if ($length -lt 2 -or $length -gt 128) { return $false }
-        if ($address.Equals([Net.IPAddress]::IPv6Loopback)) { return $false }
-        if (($bytes[0] -band 0xFE) -eq 0xFC) { return $false }
-        if ($bytes[0] -eq 0xFE -and ($bytes[1] -band 0xC0) -eq 0x80) { return $false }
-        if ($bytes[0] -eq 0xFF) { return $false }
-        return $true
+        # Public IPv6 unicast is allocated from 2000::/3. Look for distinct
+        # blocks within that range, rather than both halves of all IPv6 space.
+        if ($length -lt 3 -or $length -gt 128 -or ($bytes[0] -band 0xE0) -ne 0x20) { return }
+        if ($length -eq 3) { return 'IPv6 global' }
+        if ($bytes[0] -eq 0x20 -and $bytes[1] -eq 0x02) { return }
+        if ($bytes[0] -eq 0x20 -and $bytes[1] -eq 0x01 -and
+            (($bytes[2] -eq 0 -and $bytes[3] -in @(0, 2)) -or ($bytes[2] -eq 0x0D -and $bytes[3] -eq 0xB8))) { return }
+        if ($bytes[0] -eq 0x3F -and $bytes[1] -eq 0xFF -and ($bytes[2] -band 0xF0) -eq 0) { return }
+        return ('IPv6 {0:X2}{1:X2}' -f $bytes[0], $bytes[1])
     }
-    return $false
 }
 
 function Get-AutomaticVpnAdapters {
@@ -140,24 +144,25 @@ function Get-AutomaticVpnAdapters {
         if ($used.Count -eq 2 -and $used[0] -eq $used[1]) { $used[0] }
     })
     # A split-tunnel VPN may publish an exclusion list with thousands of specific
-    # routes instead of a default. Accept it only when its public routes reach
-    # both halves of a family; one half or a private-only tunnel stays fail-closed.
+    # routes instead of a default. Require public coverage in both IPv4 halves
+    # or distinct IPv6 global unicast blocks. A private-only tunnel stays closed.
     $candidateIndices = @($candidates | ForEach-Object { [int]$_.InterfaceIndex } | Sort-Object -Unique)
-    $publicHalves = @{}
+    $publicGroups = @{}
     foreach ($route in @($Routes | Where-Object { [int]$_.InterfaceIndex -in $candidateIndices })) {
-        $prefix = [string]$route.DestinationPrefix
-        if (-not (Test-PublicRoutePrefix $prefix)) { continue }
-        $address = [Net.IPAddress]::Parse($prefix.Split('/')[0])
-        if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-            $half = if ($address.GetAddressBytes()[0] -lt 128) { 'IPv4 lower' } else { 'IPv4 upper' }
-        } else {
-            $half = if ($address.GetAddressBytes()[0] -lt 0x80) { 'IPv6 lower' } else { 'IPv6 upper' }
+        $group = Get-PublicRouteGroup $route.DestinationPrefix
+        if (-not $group) { continue }
+        $index = [int]$route.InterfaceIndex
+        if (-not $publicGroups.ContainsKey($index)) {
+            $publicGroups[$index] = [Collections.Generic.HashSet[string]]::new()
         }
-        $publicHalves["$($route.InterfaceIndex)|$half"] = $true
+        [void]$publicGroups[$index].Add($group)
     }
     $split = @(foreach ($index in $candidateIndices) {
-        if (($publicHalves.ContainsKey("$index|IPv4 lower") -and $publicHalves.ContainsKey("$index|IPv4 upper")) -or
-            ($publicHalves.ContainsKey("$index|IPv6 lower") -and $publicHalves.ContainsKey("$index|IPv6 upper"))) { $index }
+        $groups = $publicGroups[$index]
+        if (-not $groups) { continue }
+        $ipv4 = $groups.Contains('IPv4 lower') -and $groups.Contains('IPv4 upper')
+        $ipv6 = $groups.Contains('IPv6 global') -or @($groups | Where-Object { $_ -like 'IPv6 *' }).Count -ge 2
+        if ($ipv4 -or $ipv6) { $index }
     })
     $accepted = @(@($indices) + @($split) | Sort-Object -Unique)
     return @($candidates | Where-Object InterfaceIndex -in $accepted)
